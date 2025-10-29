@@ -1,0 +1,6 @@
+[submodule "qsystem-frontend"]
+	path = qsystem-frontend
+	url = git@github.com:anuareramirez/qsystem-frontend.git
+[submodule "qsystem-backend"]
+	path = qsystem-backend
+	url = git@github.com:anuareramirez/qsystem-backend.git
