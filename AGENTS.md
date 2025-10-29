@@ -50,6 +50,78 @@ cd qsystem-frontend && npm run lint
 - **Backend (Django)**: http://localhost:8003
 - **Base de datos (PostgreSQL)**: localhost:5432
 
+## 📦 Git Workflow con Submodules
+
+### ⚠️ IMPORTANTE: Este es un Monorepo con Submodules
+
+El proyecto usa **Git Submodules** para manejar 3 repositorios:
+- **Monorepo principal**: `anuareramirez/qsystem` (este repo)
+- **Frontend**: `anuareramirez/qsystem-frontend` (submodule)
+- **Backend**: `anuareramirez/qsystem-backend` (submodule)
+
+### Hacer Commits (USA EL SCRIPT)
+
+**SIEMPRE usa el script `commit-helper.sh` para hacer commits:**
+
+```bash
+# Si solo modificaste el FRONTEND
+./commit-helper.sh frontend "feat: add new login component"
+
+# Si solo modificaste el BACKEND
+./commit-helper.sh backend "fix: resolve database migration issue"
+
+# Si modificaste AMBOS
+./commit-helper.sh both "feat: implement new API endpoint and UI"
+```
+
+**¿Qué hace el script?**
+1. Hace commit en el(los) submodule(s) correspondiente(s)
+2. Actualiza la referencia en el monorepo principal
+3. Hace push a todos los repos necesarios automáticamente
+
+### ❌ NO hagas esto manualmente
+
+**NO uses `git commit` directamente** - usa el script `commit-helper.sh`
+
+Si necesitas hacer algo manualmente:
+```bash
+# 1. Commit en submodule
+cd qsystem-frontend  # o qsystem-backend
+git add .
+git commit -m "tu mensaje"
+git push
+
+# 2. Volver a raíz y actualizar monorepo
+cd ..
+git add qsystem-frontend  # o qsystem-backend
+git commit -m "chore: update frontend submodule"
+git push
+```
+
+### Clonar el proyecto (para nuevos desarrolladores)
+
+```bash
+# Clonar con submodules
+git clone --recurse-submodules git@github.com:anuareramirez/qsystem.git
+
+# O si ya clonaste sin --recurse-submodules
+git submodule update --init --recursive
+```
+
+### Actualizar submodules (pull de cambios remotos)
+
+```bash
+# Actualizar todos los submodules a sus últimos commits
+git submodule update --remote --merge
+
+# O actualizar uno específico
+cd qsystem-frontend
+git pull origin main
+cd ..
+git add qsystem-frontend
+git commit -m "chore: update frontend submodule"
+```
+
 ## 🏗️ Architecture Overview
 
 ```
