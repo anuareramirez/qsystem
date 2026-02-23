@@ -3,6 +3,9 @@
 .env.local
 .env.*.local
 
+# MCP servers config (contains secrets)
+.mcp.json
+
 # Dependencies
 node_modules/
 
