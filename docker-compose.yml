@@ -70,6 +70,48 @@ services:
     volumes:
       - ./qsystem-frontend/default.conf:/etc/nginx/conf.d/default.conf:ro
 
+  cron:
+    build: ./qsystem-backend
+    entrypoint: >
+      sh -c "
+        apt-get update && apt-get install -y --no-install-recommends cron tzdata &&
+        rm -rf /var/lib/apt/lists/* &&
+        ln -snf /usr/share/zoneinfo/America/Mexico_City /etc/localtime &&
+        echo America/Mexico_City > /etc/timezone &&
+        env >> /etc/environment &&
+        crontab /app/crontab &&
+        touch /var/log/cron.log &&
+        cron -f
+      "
+    volumes:
+      - ./qsystem-backend:/app
+      - media_volume:/app/media
+      - static_volume:/app/staticfiles
+    environment:
+      - DEBUG=${DEBUG:-True}
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
+      - DB_NAME=${DB_NAME:-qsystem}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-postgres}
+      - DB_HOST=db
+      - DB_PORT=5432
+      - POSTGRES_DB=${DB_NAME:-qsystem}
+      - POSTGRES_USER=${DB_USER:-postgres}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-postgres}
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-localhost,127.0.0.1,backend}
+      - TZ=America/Mexico_City
+      - USE_S3=${USE_S3:-False}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_STORAGE_BUCKET_NAME=${AWS_STORAGE_BUCKET_NAME}
+      - AWS_S3_REGION_NAME=${AWS_S3_REGION_NAME:-us-east-1}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - qsystem-network
+
   # Development frontend service (optional - comment out in production)
   frontend-dev:
     image: node:18-alpine
