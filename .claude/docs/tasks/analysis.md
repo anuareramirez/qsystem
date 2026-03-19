@@ -1,1068 +1,1323 @@
-# Codebase Analysis Report
-**Generated**: 2026-02-23
+# Codebase Analysis Report — State Machine Deep Dive
+**Generated**: 2026-03-16
 **Analyst**: codebase-analyzer
-**Request**: Thorough analysis of all management tabs — section by section, entity type, data classification (CATALOG / OPERATIONAL / SYSTEM CONFIG), and logical module ownership.
+**Request**: Comprehensive state machine analysis: CursoAgendado, CotizacionAbierta, CotizacionCerrada, FichaDeInscripcion, Factura — all model fields, signals, cascade behaviors, and edge cases.
+
+---
+
+<!-- ============================================================ -->
+<!-- SECTION: STATE MACHINE ANALYSIS (added 2026-03-16)          -->
+<!-- ============================================================ -->
+
+## Executive Summary — State Machine Analysis
+
+This project implements a multi-entity state machine across five core domain objects: `CursoAgendado`, `CotizacionAbierta`, `CotizacionCerrada`, `FichaDeInscripcion`, and `Factura`. Each entity has its own lifecycle, but their state machines are deeply coupled through Django signals, explicit cascade methods, and view-layer orchestration logic. The coupling is predominantly unidirectional — cotizaciones drive curso states, and the curso drives ficha states — but there are several bidirectional feedback loops that create subtle race conditions and edge cases.
+
+The system distinguishes between two course tracks: "open" courses (`tipo_curso="abierto"`) marketed to the public via `CotizacionAbierta`, and "closed" courses (`tipo_curso="cerrado"`) created exclusively when a `CotizacionCerrada` is accepted. `Factura` is downstream of both quotation types and has no signals that drive upstream state changes; it is purely a billing record. The most complex logic is concentrated in `CursoAgendado.cambiar_estado()`, `_cancelar_relacionados()`, `_completar_fichas()`, and the signal files in `ventas/signals.py`, `logistica/signals.py`, and `core/signals.py`.
+
+---
+
+## Entity State Machines
+
+---
+
+### 1. CursoAgendado
+
+**Location**: `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/core/models.py`
+
+#### States
+
+| State | Meaning |
+|---|---|
+| `AGENDADO` | Scheduled but no quotations exist |
+| `PROSPECTADO` | At least one active quotation (not rejected/expired) |
+| `CONFIRMADO` | Quotation accepted (cerrada) OR minimum participants reached |
+| `EN_PROCESO` | Start date has arrived |
+| `FINALIZADO` | Course completed |
+| `CANCELADO` | Definitively cancelled |
+| `VENCIDO` | Start date passed without confirmation |
+
+#### Valid Manual Transitions (from `cambiar_estado()`)
+
+```
+AGENDADO     → PROSPECTADO, CANCELADO, VENCIDO
+PROSPECTADO  → CONFIRMADO, CANCELADO, VENCIDO, AGENDADO
+CONFIRMADO   → EN_PROCESO, CANCELADO, PROSPECTADO, AGENDADO
+EN_PROCESO   → FINALIZADO, CANCELADO
+FINALIZADO   → (none — terminal)
+CANCELADO    → AGENDADO
+VENCIDO      → CONFIRMADO, AGENDADO, CANCELADO
+```
+
+#### Valid Automatic Transitions (from `core/signals.py` pre_save)
+
+Only fires when `fechai` or `fechaf` changes via `FieldTracker`:
+
+```
+AGENDADO    → VENCIDO     (if today > fechaf)
+PROSPECTADO → VENCIDO     (if today > fechaf)
+CONFIRMADO  → EN_PROCESO  (if today >= fechai)
+CONFIRMADO  → FINALIZADO  (if today > fechaf)
+EN_PROCESO  → FINALIZADO  (if today > fechaf)
+```
+
+#### Transition Triggers
+
+| Transition | Triggered By | Source |
+|---|---|---|
+| AGENDADO → PROSPECTADO | New CotizacionAbierta created pointing to this curso | `ventas/signals.py: actualizar_estado_curso_por_cotizacion_abierta` (created=True) |
+| AGENDADO → PROSPECTADO | CotizacionCerrada M2M add (curso added to cotizacion) | `ventas/signals.py: actualizar_estado_cursos_por_m2m_cerrada` (post_add) |
+| AGENDADO → PROSPECTADO | New CotizacionCerrada post_save with created=True | `ventas/signals.py: actualizar_estado_curso_por_cotizacion_cerrada` |
+| PROSPECTADO → AGENDADO | Last active CotizacionAbierta rejected | `ventas/signals.py: actualizar_estado_curso_por_cotizacion_abierta` |
+| PROSPECTADO → AGENDADO | CotizacionAbierta hard-deleted | `ventas/signals.py: verificar_estado_curso_al_eliminar_cotizacion` |
+| PROSPECTADO → CONFIRMADO | Participant added to ficha, minimum reached | `logistica/signals.py: verificar_confirmacion_curso_al_agregar_participante` |
+| PROSPECTADO → CONFIRMADO | Ficha confirmed, minimum reached | `logistica/signals.py: verificar_confirmacion_curso_al_confirmar_ficha` |
+| PROSPECTADO → VENCIDO | Ficha confirmed, start date already passed | `logistica/signals.py: verificar_confirmacion_curso_al_confirmar_ficha` |
+| ANY → VENCIDO | fechai/fechaf changes on curso, auto-calc fires | `core/signals.py: actualizar_estado_curso_automatico` (pre_save) |
+| CONFIRMADO → EN_PROCESO | fechai changes, today >= fechai | `core/signals.py` (pre_save) |
+| CONFIRMADO → EN_PROCESO | CotizacionCerrada accepted + start date passed | `ventas/signals.py: actualizar_estado_curso_por_cotizacion_cerrada` |
+| CONFIRMADO → EN_PROCESO | CotizacionCerrada.cambiar_estado("aceptada") view action | `ventas/views.py: CotizacionCerradaViewSet.cambiar_estado` |
+| CONFIRMADO → PROSPECTADO | Ficha cancelled/reverted, drops below minimum | `logistica/signals.py: verificar_confirmacion_curso_al_confirmar_ficha` |
+| ANY → CANCELADO | Manual call via `cambiar_estado("CANCELADO")` | `CursoAgendado.cambiar_estado()` → `_cancelar_relacionados()` |
+| EN_PROCESO → FINALIZADO | Manual or auto (fechaf) | `cambiar_estado()` → `_completar_fichas()` |
+| PROSPECTADO → CANCELADO | CotizacionCerrada rejected, no other active cotizaciones | `ventas/signals.py: actualizar_estado_curso_por_cotizacion_cerrada` |
+| VENCIDO → (any) | Cotizaciones vencidas expired by core/signals when curso → VENCIDO | `core/signals.py: vencer_cotizaciones_por_curso_vencido` |
+
+#### Cascade Side Effects of CANCELADO
+
+When `cambiar_estado("CANCELADO")` is called, `_cancelar_relacionados()` fires atomically:
+
+1. All `CotizacionAbierta` linked to this curso (non-rejected) → set to `"rechazada"`
+2. All `FichaDeInscripcion` linked to those cotizaciones abiertas (non-cancelled) → set to `"cancelada"` with `_skip_signal=True`
+3. All child recotizaciones of those cotizaciones abiertas → set to `"rechazada"`, their fichas → `"cancelada"`
+4. All `CotizacionCerrada` in `cursos_agendados` (non-rejected) → set to `"rechazada"`
+5. All `FichaDeInscripcion` linked to those cotizaciones cerradas (non-cancelled) → `"cancelada"` with `_skip_signal=True`
+6. All child recotizaciones of those cotizaciones cerradas → `"rechazada"`, their fichas → `"cancelada"`
+7. All `FichaDeInscripcion` in `fichas_directas` (reagendamiento case) → `"cancelada"` with `_skip_signal=True`
+
+**Critical note**: `_skip_signal=True` is set on fichas before saving to prevent the `verificar_confirmacion_curso_al_confirmar_ficha` signal from triggering a PROSPECTADO downgrade loop.
+
+#### Cascade Side Effects of FINALIZADO
+
+When `cambiar_estado("FINALIZADO")` is called, `_completar_fichas()` fires atomically:
+
+1. All fichas in state `"confirmada"` or `"en_proceso"` (via cotizaciones abiertas, cerradas, and `fichas_directas`) → `"completada"` with `_skip_signal=True`
+2. All fichas in state `"pendiente"` → `"cancelada"` with `_skip_signal=True`
+
+#### Cascade Side Effects of VENCIDO (core/signals.py)
+
+When CursoAgendado transitions to VENCIDO (via `post_save` signal `vencer_cotizaciones_por_curso_vencido`):
+
+1. All `CotizacionAbierta` in states `["borrador", "realizada", "enviada"]` for this curso → set `estado_previo_vencimiento = current_estado`, then `estado = "vencida"` (saved with `update_fields`)
+2. All `CotizacionCerrada` in states `["borrador", "realizada", "enviada"]` with this curso in `cursos_agendados` → same treatment
+
+**Note**: Fichas are NOT touched when a curso goes VENCIDO. Only cotizaciones are expired.
+
+#### Date Limit Update on Reagendamiento (core/signals.py)
+
+When `fechai` changes on CursoAgendado (post_save, FieldTracker detects change):
+
+- All `FichaDeInscripcion` linked via `CotizacionCerrada` that are NOT in `["confirmada", "completada"]` → `fecha_limite_inscripcion` updated to earliest `fechai` across all cursos in that cotizacion
+- All `FichaDeInscripcion` with `curso_asociado=this_curso` that are NOT in `["confirmada", "completada"]` → `fecha_limite_inscripcion = nueva_fechai`
+
+---
+
+### 2. CotizacionAbierta
+
+**Location**: `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/ventas/models.py`
+
+#### States
+
+| State | Meaning |
+|---|---|
+| `borrador` | Initial state, PDF not yet generated |
+| `realizada` | PDF uploaded (borrador → realizada via `upload_pdf` action) |
+| `enviada` | Sent by email to client (realizada/enviada → enviada via `send_email`) |
+| `aceptada` | Client accepted |
+| `rechazada` | Client rejected or cancelled by system |
+| `recotizada` | Superseded by a new re-quote |
+| `vencida` | Expired (either date passed, or curso went VENCIDO) |
+
+#### Valid Transitions (`TRANSICIONES_VALIDAS`)
+
+```
+borrador   → realizada
+realizada  → enviada, rechazada, recotizada
+enviada    → aceptada, rechazada, recotizada
+rechazada  → recotizada
+recotizada → (none — terminal)
+aceptada   → rechazada
+vencida    → realizada
+```
+
+#### Transition Triggers and Side Effects
+
+| Transition | Trigger | Side Effect |
+|---|---|---|
+| borrador → realizada | `upload_pdf` view action (file upload) | PDF stored, estado set directly (bypasses TRANSICIONES_VALIDAS check in view) |
+| realizada → enviada | `send_email` view action (success) | Email sent to client |
+| enviada → aceptada | Manual `cambiar_estado` view action | `post_save` signal fires → curso PROSPECTADO (if AGENDADO) |
+| aceptada → rechazada | Manual `cambiar_estado` | All non-cancelled fichas linked to this cotizacion → `"cancelada"` (in view, NOT via model cascade) |
+| any → recotizada | `duplicar` view action with `es_recotizacion=True` | Original cotizacion → `"recotizada"`, all its fichas → `"cancelada"`, new cotizacion created in `"realizada"` |
+| any → vencida | `vencer_cotizaciones_por_curso_vencido` signal (when curso goes VENCIDO) | `estado_previo_vencimiento` saved for potential reactivation |
+| vencida → realizada | Via `transfer_relationships()` during reagendamiento | `estado_previo_vencimiento` cleared, `fecha_vencimiento` set to new `fechai` |
+
+#### Effect on CursoAgendado
+
+- **Created** (new cotizacion with `curso` set): If curso is AGENDADO → PROSPECTADO
+- **Rejected**: If no remaining active cotizaciones → curso AGENDADO (from PROSPECTADO/CONFIRMADO)
+- **Hard-deleted** (`post_delete` signal): Same check as rejection
+- **Accepted** (estado="aceptada"): If curso is AGENDADO → PROSPECTADO (cotizaciones abiertas do NOT push to CONFIRMADO; only cerradas do)
+
+**Key asymmetry**: A `CotizacionAbierta` acceptance only drives a curso to PROSPECTADO, never to CONFIRMADO. CONFIRMADO for open courses requires participant minimum to be reached.
+
+#### `vencida` State Behavior
+
+- `estado_previo_vencimiento` stores the state before vencimiento
+- The `vencida → realizada` transition in `TRANSICIONES_VALIDAS` enables reactivation
+- During `transfer_relationships()`, vencida cotizaciones are reactivated to their `estado_previo_vencimiento` (or `"realizada"` as default)
+
+---
+
+### 3. CotizacionCerrada
+
+**Location**: `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/ventas/models.py`
+
+#### States
+
+Identical choices to CotizacionAbierta:
+`borrador`, `realizada`, `enviada`, `aceptada`, `rechazada`, `recotizada`, `vencida`
+
+#### Valid Transitions (`TRANSICIONES_VALIDAS`)
+
+Identical to CotizacionAbierta.
+
+#### Key Structural Differences from CotizacionAbierta
+
+1. **M2M relationship** to CursoAgendado via `cursos_agendados` (one cotizacion can cover multiple cursos and groups)
+2. **Items** (`ItemCotizacionCerrada`) define the line-item details (curso de catálogo, participantes, grupos, price)
+3. **CursoAgendado instances are CREATED at acceptance time** — they do not pre-exist
+4. `curso_agendado_original` FK for tracking after desvinculacion
+
+#### Unique Constraint on M2M
+
+The `m2m_changed` signal (`actualizar_estado_cursos_por_m2m_cerrada`) enforces:
+- A CursoAgendado cannot belong to more than one active `CotizacionCerrada` (`pre_add` raises `ValidationError`)
+- The CursoAgendado's `curso` FK must match a `CursoCatalogo` present in the cotizacion's items
+
+#### Transition Triggers and Side Effects
+
+| Transition | Trigger | Side Effect |
+|---|---|---|
+| borrador → realizada | `upload_pdf` view action | PDF stored |
+| realizada → enviada | `send_email` action (success) | Email sent |
+| any → aceptada | `cambiar_estado` view action | **CursoAgendado instances CREATED** (one per group per item), added to `cursos_agendados` M2M, each starts at `CONFIRMADO`; if `fechai` already passed → immediately advanced to `EN_PROCESO` |
+| aceptada → rechazada | `cambiar_estado` view action | All non-cancelled fichas → `"cancelada"` (in view) |
+| any → recotizada | `duplicar` with `es_recotizacion=True` | Original → `"recotizada"`, fichas → `"cancelada"`, new cotizacion starts at `"realizada"` |
+| any → vencida | `vencer_cotizaciones_por_curso_vencido` signal | `estado_previo_vencimiento` saved |
+
+#### Effect on CursoAgendado (post_save signal)
+
+- **estado="aceptada"**: If curso is AGENDADO → PROSPECTADO → CONFIRMADO (two sequential calls within the same signal iteration). Then if `fechai` passed → EN_PROCESO
+- **estado="rechazada"**: If no other active cotizaciones → curso CANCELADO (IMPORTANT: cerradas cancel the curso, abiertas only revert to AGENDADO)
+- **created=True**: If curso is AGENDADO → PROSPECTADO
+
+**Critical asymmetry vs. CotizacionAbierta**: Rejection of a CotizacionCerrada leads to CANCELADO for the linked cursos, not just AGENDADO. This makes sense because closed-course cursos are created specifically for this cotizacion.
+
+#### INTERESADOS Category
+
+CotizacionCerradas without any `cursos_agendados` attached (`cursos_agendados__isnull=True`) are treated as "interesados" in the frontend and excluded from normal list views. This represents closed-course leads that haven't been assigned to scheduled courses yet.
+
+---
+
+### 4. FichaDeInscripcion
+
+**Location**: `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/logistica/models.py`
+
+#### States
+
+| State | Meaning |
+|---|---|
+| `pendiente` | Created, awaiting participant data |
+| `confirmada` | All participants registered and confirmed |
+| `en_proceso` | Course is running |
+| `completada` | Course finished, participants completed |
+| `cancelada` | Cancelled (by system cascade or manual) |
+
+#### Secondary State: `estado_inscripcion`
+
+Separate from `estado`, tracks data completeness:
+`sin_iniciar`, `parcial`, `completa`
+
+#### Key Structural Points
+
+- **Polymorphic FK**: Has either `cotizacion_abierta` OR `cotizacion_cerrada`, enforced by both a `CheckConstraint` at DB level and `clean()` validation
+- **curso_asociado**: Optional direct FK to CursoAgendado for reagendamiento cases where the ficha is migrated to a new curso
+- **ficha_origen**: Self-referential FK for tracking reagendamiento lineage
+- **Constraint**: `logistica_ficha_una_sola_cotizacion` ensures only one of the two FKs is set
+
+#### Transition Triggers
+
+| Transition | Trigger | Source |
+|---|---|---|
+| pendiente → confirmada | Manual action by logistica staff | View or API call |
+| confirmada → (course state changes) | FichaDeInscripcion post_save signal | `logistica/signals.py: verificar_confirmacion_curso_al_confirmar_ficha` |
+| any → cancelada | `_cancelar_relacionados()` on curso | `CursoAgendado._cancelar_relacionados()` with `_skip_signal=True` |
+| any → cancelada | Cotizacion `aceptada → rechazada` transition | `ventas/views.py` cambiar_estado handlers |
+| any → cancelada | Cotizacion `duplicar` with `es_recotizacion=True` | `ventas/views.py` duplicar handlers |
+| confirmada/en_proceso → completada | `_completar_fichas()` on curso FINALIZADO | `CursoAgendado._completar_fichas()` with `_skip_signal=True` |
+| pendiente → cancelada | `_completar_fichas()` on curso FINALIZADO | Same — pending fichas cancelled when course finalizes |
+
+#### Effect on CursoAgendado (via logistica/signals.py)
+
+**When Participante added** (post_save, created=True):
+- Finds associated cursos via cotizacion_abierta, cotizacion_cerrada, or curso_asociado
+- If curso is PROSPECTADO and `alcanzo_minimo_participantes` → CONFIRMADO
+
+**When FichaDeInscripcion saved** (post_save, not created):
+- If `estado == "confirmada"`:
+  - For each associated curso in PROSPECTADO: if minimum reached → CONFIRMADO; if start date passed → VENCIDO
+  - For each curso in CONFIRMADO: if start date reached → EN_PROCESO
+- If `estado in ("en_proceso", "cancelada")`:
+  - For each associated curso in CONFIRMADO: if below minimum → PROSPECTADO
+
+**When Participante deleted** (post_delete):
+- Only logs a warning — does NOT automatically degrade curso state
+- Degradation only happens through explicit ficha state changes (cancelada/en_proceso)
+
+#### `_skip_signal` Flag
+
+When `_cancelar_relacionados()` or `_completar_fichas()` cascade-cancels or completes fichas, they set `instance._skip_signal = True` before saving. The `verificar_confirmacion_curso_al_confirmar_ficha` signal checks `getattr(instance, "_skip_signal", False)` at the start and returns early if set. This prevents feedback loops.
+
+#### Confirming a Ficha (save() override)
+
+When a ficha transitions to `"confirmada"`, the `save()` override:
+1. Detects the transition using `select_for_update()` on the old instance
+2. After the save, bulk-updates all active `Participante` records: `confirmado=True, fecha_confirmacion=timezone.now()`
+3. All within the same `transaction.atomic()` block
+
+---
+
+### 5. Factura
+
+**Location**: `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/contabilidad/models.py`
+
+#### States
+
+| State | Meaning |
+|---|---|
+| `borrador` | Draft |
+| `emitida` | Issued |
+| `timbrada` | Digitally stamped (SAT/CFDI) |
+| `cancelada` | Cancelled |
+| `pagada` | Fully paid |
+
+#### Key Structural Points
+
+- **Mutually exclusive FKs**: Either `cotizacion_abierta` OR `cotizacion_cerrada` (validated in `clean()` and `FacturaCreateUpdateSerializer.validate()`)
+- Serializer blocks Factura creation when cotizacion is in `"rechazada"` or `"recotizada"` states
+- `pagada` state is set automatically by `actualizar_saldo_pendiente()` when `saldo_pendiente <= 0`
+- No signals connect Factura back to CursoAgendado or cotizacion state changes — billing is downstream only
+- `notas_desvinculacion` + `cotizacion_original_ref` fields provide audit trail after cotizacion deletion
+
+#### Pago Model
+
+- `estado`: `pendiente`, `confirmado`, `rechazado`, `cancelado`
+- Confirmed pagos reduce `saldo_pendiente` on the Factura
+- When `saldo_pendiente` reaches zero, `actualizar_saldo_pendiente()` sets Factura to `"pagada"`
+- Serializer validates `monto <= factura.saldo_pendiente`
+
+---
+
+## Cross-Entity Cascade Matrix
+
+| Trigger | Entity Affected | Condition |
+|---|---|---|
+| CursoAgendado → CANCELADO | CotizacionAbierta → "rechazada" | All non-rejected cotizaciones |
+| CursoAgendado → CANCELADO | CotizacionCerrada → "rechazada" | All non-rejected cotizaciones |
+| CursoAgendado → CANCELADO | FichaDeInscripcion → "cancelada" | All non-cancelled fichas via cots + directas, `_skip_signal=True` |
+| CursoAgendado → CANCELADO | Child recotizaciones → "rechazada" | One level deep only |
+| CursoAgendado → FINALIZADO | FichaDeInscripcion → "completada" | fichas in "confirmada"/"en_proceso", `_skip_signal=True` |
+| CursoAgendado → FINALIZADO | FichaDeInscripcion → "cancelada" | fichas in "pendiente", `_skip_signal=True` |
+| CursoAgendado → VENCIDO | CotizacionAbierta → "vencida" | Cotizaciones in "borrador","realizada","enviada" |
+| CursoAgendado → VENCIDO | CotizacionCerrada → "vencida" | Same |
+| CursoAgendado.fechai changes | FichaDeInscripcion.fecha_limite_inscripcion | Non-confirmed/completed fichas only |
+| CotizacionAbierta created | CursoAgendado → PROSPECTADO | If curso was AGENDADO |
+| CotizacionAbierta → "rechazada" | CursoAgendado → AGENDADO | If no other active cotizaciones remain |
+| CotizacionAbierta deleted | CursoAgendado → AGENDADO | If no remaining cotizaciones (from PROSPECTADO only) |
+| CotizacionAbierta → "aceptada" | CursoAgendado → PROSPECTADO | If curso was AGENDADO (NOT CONFIRMADO) |
+| CotizacionAbierta → "aceptada" → "rechazada" | FichaDeInscripcion → "cancelada" | All non-cancelled fichas (view, no signal) |
+| CotizacionAbierta → "recotizada" | CotizacionAbierta (child) created; fichas → "cancelada" | |
+| CotizacionCerrada added to M2M | CursoAgendado → PROSPECTADO | If curso was AGENDADO |
+| CotizacionCerrada → "aceptada" | CursoAgendado CREATED at CONFIRMADO | One per group per item |
+| CotizacionCerrada → "aceptada" | CursoAgendado → EN_PROCESO | If fechai already passed |
+| CotizacionCerrada → "rechazada" | CursoAgendado → CANCELADO | If no other active cotizaciones |
+| CotizacionCerrada → "aceptada" → "rechazada" | FichaDeInscripcion → "cancelada" | All non-cancelled fichas (view) |
+| Participante created | CursoAgendado → CONFIRMADO | If PROSPECTADO and minimum reached |
+| FichaDeInscripcion → "confirmada" | CursoAgendado → CONFIRMADO | If PROSPECTADO and minimum reached |
+| FichaDeInscripcion → "confirmada" | CursoAgendado → VENCIDO | If PROSPECTADO and fechai already passed |
+| FichaDeInscripcion → "confirmada" | CursoAgendado → EN_PROCESO | If CONFIRMADO and fechai passed |
+| FichaDeInscripcion → "cancelada"/"en_proceso" | CursoAgendado → PROSPECTADO | If CONFIRMADO and below minimum |
+| Pago confirmed | Factura → "pagada" | When saldo_pendiente <= 0 |
+
+---
+
+## Critical Signal Execution Order
+
+### When CotizacionCerrada is accepted (view action)
+
+1. View validates transition using `TRANSICIONES_VALIDAS`
+2. View creates `CursoAgendado` instances with `estado="CONFIRMADO"` directly (bypass AGENDADO→PROSPECTADO)
+3. View adds cursos to `cotizacion.cursos_agendados` M2M
+4. M2M `post_add` signal fires: tries AGENDADO→PROSPECTADO (no-op since cursos already CONFIRMADO)
+5. View sets `cotizacion.estado = "aceptada"` and saves
+6. CotizacionCerrada `post_save` signal fires: checks for EN_PROCESO advancement if fechai passed
+
+**Race condition**: Steps 2-3 and 5-6 are NOT inside a single `transaction.atomic()` at the view level. CursoAgendado instances survive even if `cotizacion.save()` fails.
+
+### Alternative path via send_inscription_form
+
+The `CotizacionCerradaViewSet.send_inscription_form` action contains a **duplicate** CursoAgendado creation path with differences:
+- Uses `item.curso.instructor.first()` as default instructor (with fallback)
+- `num_grupos` calculated as `math.ceil(total_participantes / 20)` (hardcoded 20 max)
+- NOT wrapped in `transaction.atomic()`
+- Creates `FichaDeInscripcion` immediately after acceptance
+
+This is a second mechanism for accepting a CotizacionCerrada with subtly different behavior.
+
+---
+
+## Identified Edge Cases and Issues
+
+### Issue 1: VENCIDO via pre_save bypasses `cambiar_estado()`
+
+`actualizar_estado_curso_automatico` (pre_save) sets `instance.estado = "VENCIDO"` directly without calling `cambiar_estado()`. Result: `_cancelar_relacionados()` is NOT called. The `vencer_cotizaciones_por_curso_vencido` post_save signal handles cotizacion expiration, but fichas are not touched.
+
+### Issue 2: Recotizacion chain only one level deep
+
+`_cancelar_relacionados()` iterates `cotizacion.recotizaciones` but does not recurse. A three-level chain A → B → C leaves C's fichas active when cancelling A.
+
+### Issue 3: Two acceptance paths for CotizacionCerrada
+
+`cambiar_estado("aceptada")` and `send_inscription_form` both create CursoAgendado instances. Calling both on the same cotizacion produces duplicate CursoAgendado records. `send_inscription_form` checks for existing fichas but not for existing cursos.
+
+### Issue 4: CONFIRMADO → AGENDADO on last CotizacionAbierta rejection
+
+When the last active CotizacionAbierta is rejected, the signal reverts the curso from PROSPECTADO or CONFIRMADO to AGENDADO. However, if the curso reached CONFIRMADO via participant minimum (not via cotizacion acceptance), reverting to AGENDADO discards that participant-driven confirmation.
+
+### Issue 5: No automatic FichaDeInscripcion creation on CotizacionAbierta acceptance
+
+The standard `CotizacionAbierta.cambiar_estado("aceptada")` does NOT create a ficha. Only `send_inscription_form` (a CotizacionCerrada action) creates fichas automatically. Open course ficha creation is a separate workflow step.
+
+### Issue 6: Race condition on participant minimum check
+
+`alcanzo_minimo_participantes` uses a live DB aggregate. Two concurrent participant additions may both see count below minimum, causing neither to trigger CONFIRMADO. No `select_for_update()` in `verificar_confirmacion_curso_al_agregar_participante`.
+
+### Issue 7: `upload_pdf` implicit transition not in `TRANSICIONES_VALIDAS`
+
+Both cotizacion types allow `borrador → realizada` only via the `upload_pdf` action. The view validates `estado == "borrador"` before proceeding. This works but the transition is not encoded in the model's `TRANSICIONES_VALIDAS` constant.
+
+---
+
+## Key File Reference
+
+| File | Content |
+|---|---|
+| `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/core/models.py` | CursoAgendado (states, `cambiar_estado`, `_cancelar_relacionados`, `_completar_fichas`, `actualizar_estado_automatico`) |
+| `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/core/signals.py` | Auto-state transitions on date change; VENCIDO → cotizacion expiration; fecha_limite update on reagendamiento |
+| `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/ventas/models.py` | CotizacionAbierta, CotizacionCerrada, ItemCotizacionCerrada, AutorizacionDescuento |
+| `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/ventas/signals.py` | Cotizacion post_save, post_delete, M2M signals → CursoAgendado state changes |
+| `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/ventas/views.py` | `cambiar_estado` actions (CursoAgendado creation on cerrada acceptance), `duplicar`, `send_inscription_form` |
+| `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/logistica/models.py` | FichaDeInscripcion (states, constraints, save override, prellenar, fecha_limite) |
+| `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/logistica/signals.py` | Participante/Ficha signals → CursoAgendado state changes |
+| `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/contabilidad/models.py` | Factura, Pago, NotaCredito, ComprobanteGasto |
+| `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/contabilidad/serializers.py` | Factura validation (blocks rechazada/recotizada cotizaciones); FacturaCursoSerializer auto-link |
+
+<!-- ============================================================ -->
+<!-- END: STATE MACHINE ANALYSIS                                  -->
+<!-- ============================================================ -->
+
+---
+
+## Previous Analysis Content Below
+
+---
+
+## Part 2: Focused Deep-Dive Analysis
+
+### Topics: Multi-seller scenarios, Factura relationships, FichaDeInscripcion lifecycle, Reagendamiento
+
+---
+
+### 1. Multi-Seller Scenarios
+
+#### CotizacionAbierta (open / public courses)
+
+A `CotizacionAbierta` has a direct FK to a single `CursoAgendado` (`curso`). Multiple sellers can create separate `CotizacionAbierta` records all pointing to the same `CursoAgendado`. There is NO database-level or application-level uniqueness constraint preventing this.
+
+**Key signal**: `actualizar_estado_curso_por_cotizacion_abierta`
+File: `qsystem-backend/src/apps/ventas/signals.py` (lines 10-85)
+
+**When one seller's quotation is accepted** (signal lines 33-61):
+- `AGENDADO` → `PROSPECTADO` (if not already there)
+- `PROSPECTADO` → `CONFIRMADO`
+- `CONFIRMADO` + date already passed → `EN_PROCESO`
+
+The acceptance of ANY single CotizacionAbierta drives the course to CONFIRMADO regardless of other sellers' quotations still being pending.
+
+**When one seller's quotation is rejected** (signal lines 63-80 — the "last rejection" logic):
+```python
+otras_cotizaciones = (
+    CotizacionAbierta.objects.filter(
+        curso=curso, deleted_date__isnull=True
+    )
+    .exclude(id=instance.id)
+    .exclude(estado__in=["rechazada", "vencida"])
+    .exists()
+)
+if not otras_cotizaciones:
+    if curso.estado in ["PROSPECTADO", "CONFIRMADO"]:
+        curso.cambiar_estado("AGENDADO", "Sin cotizaciones activas")
+```
+The course returns to AGENDADO **only when ALL remaining active quotations are also rejected/vencida**. If Seller A is rejected but Seller B still has an active quotation, the course stays at its current state unchanged.
+
+**Can two sellers both have "aceptada" CotizacionAbierta for the same course?**
+Yes — nothing prevents it. `TRANSICIONES_VALIDAS` for CotizacionAbierta (models.py line 418) allows `enviada → aceptada`. There is no uniqueness constraint on `(curso, estado='aceptada')`. The signal on second acceptance is idempotent (tries to move course to CONFIRMADO but it is already there). **This is a data integrity gap** — two sellers could both invoice the same course.
+
+#### CotizacionCerrada (closed / private courses)
+
+CotizacionCerrada uses a ManyToMany relationship to CursoAgendado via `cursos_agendados`.
+
+**The critical `pre_add` exclusivity guard** (`qsystem-backend/src/apps/ventas/signals.py` lines 209-238):
+```python
+conflictos = (
+    CotizacionCerrada.objects.filter(
+        cursos_agendados__pk__in=pk_set,
+        deleted_date__isnull=True,
+    )
+    .exclude(pk=instance.pk)
+    .distinct()
+)
+if conflictos.exists():
+    raise ValidationError(
+        f"Los cursos ya pertenecen a otra(s) cotización(es) cerrada(s) activa(s): {ids_conflicto}"
+    )
+```
+A `CursoAgendado` can belong to exactly one active `CotizacionCerrada`. Adding the same course to a second quotation raises a `ValidationError`. **This is a hard exclusive constraint** — unlike open quotations.
+
+**When a CotizacionCerrada is rejected — "last rejection" logic** (signal lines 141-159):
+```python
+otras = (
+    CotizacionCerrada.objects.filter(
+        cursos_agendados=curso, deleted_date__isnull=True
+    )
+    .exclude(id=instance.id)
+    .exclude(estado__in=["rechazada", "vencida", "recotizada"])
+    .exists()
+)
+if not otras and curso.estado not in ["CANCELADO", "FINALIZADO"]:
+    curso.cambiar_estado("CANCELADO", ...)
+```
+Unlike open quotations, rejecting the last CotizacionCerrada sends the course to **CANCELADO** — not AGENDADO. This is the most important asymmetry between the two types.
+
+**Summary: Asymmetric rejection behavior**
+
+| Quotation Type | On last rejection | Course destination |
+|---|---|---|
+| CotizacionAbierta | All others rejected/vencida | → AGENDADO |
+| CotizacionCerrada | All others rejected/vencida/recotizada | → CANCELADO |
+
+---
+
+### 2. Invoice (Factura) Relationships
+
+#### There is NO FacturaPartida model
+
+The term `FacturaPartida` does not exist anywhere in the codebase. Searching confirmed zero matches. Invoice line items are called `ItemFactura` (contabilidad/models.py line 279). There is no per-quotation-line-item invoice linking.
+
+#### Factura links to quotations
+
+File: `qsystem-backend/src/apps/contabilidad/models.py`
+
+```python
+cotizacion_abierta = ForeignKey("ventas.CotizacionAbierta", on_delete=SET_NULL, null=True)
+cotizacion_cerrada = ForeignKey("ventas.CotizacionCerrada", on_delete=SET_NULL, null=True)
+```
+
+`clean()` enforces mutual exclusivity. Multiple Factura records can reference the same quotation (no uniqueness constraint) — partial invoicing is supported by design.
+
+#### What happens to invoices when a quotation is cancelled/rejected?
+
+**Nothing automatic.** The `on_delete=SET_NULL` means:
+- If the CotizacionAbierta/CotizacionCerrada is **hard deleted**, the Factura's FK becomes NULL (desvinculada)
+- If the quotation is only **soft-deleted** or set to `estado="rechazada"` (the common case), the FK continues pointing to the rejected quotation — Factura stays in whatever state it had
+
+No signal or view logic auto-cancels a Factura when its quotation is rejected. The `_cancelar_relacionados` method in CursoAgendado (core/models.py line 896) only touches cotizaciones and fichas — invoices are completely excluded from the cascade.
+
+Desvinculadas invoices are identifiable via:
+```python
+Factura.objects.filter(
+    cotizacion_abierta__isnull=True,
+    cotizacion_cerrada__isnull=True,
+    notas_desvinculacion__isnull=False,
+)
+```
+(contabilidad/views.py lines 99-105)
+
+#### What happens to invoices when a course is CANCELLED?
+
+Nothing automatic to invoices. The cancellation cascade is:
+`CursoAgendado → cotizaciones (estado="rechazada") → fichas (estado="cancelada")`
+Invoices survive unchanged.
+
+#### Can you have multiple invoices for the same quotation?
+
+Yes. No unique constraint exists. This is intentional for installment/partial billing scenarios.
+
+---
+
+### 3. FichaDeInscripcion Deep Dive
+
+#### Model location
+`qsystem-backend/src/apps/logistica/models.py` line 103
+
+#### Linking structure (polymorphic FK)
+
+The ficha holds exactly one of two FKs (enforced by `CheckConstraint` named `logistica_ficha_una_sola_cotizacion` and `clean()` validation):
+```python
+cotizacion_abierta = ForeignKey(CotizacionAbierta, on_delete=CASCADE, null=True)
+cotizacion_cerrada = ForeignKey(CotizacionCerrada, on_delete=CASCADE, null=True)
+```
+Both use `on_delete=CASCADE` — if a quotation is hard-deleted, all its fichas are hard-deleted too.
+
+#### Reaching CursoAgendado from a ficha
+
+- Via abierta: `ficha.cotizacion_abierta.curso` (single course, direct FK)
+- Via cerrada: `ficha.cotizacion_cerrada.cursos_agendados.all()` (can be multiple courses)
+- Via reagendamiento: `ficha.curso_asociado` (a third path for rescheduled fichas, `on_delete=SET_NULL`)
+
+The convenience property `ficha.curso_agendado` (logistica/models.py line 634) only returns `cursos_agendados.first()` for cerrada fichas — this is a potential issue for multi-course quotations.
+
+#### Participante relationship
+
+`Participante → FichaDeInscripcion` FK with `on_delete=CASCADE` (logistica/models.py line 659).
+
+When a ficha is confirmed, `save()` atomically bulk-updates all active participants to `confirmado=True`:
+```python
+if is_confirming:
+    self.participantes.filter(state=True).update(
+        confirmado=True, fecha_confirmacion=timezone.now()
+    )
+```
+
+#### What happens to fichas when course state changes?
+
+**CANCELADO** — `CursoAgendado._cancelar_relacionados()` (core/models.py line 896):
+1. Each CotizacionAbierta → estado = "rechazada" → all non-cancelled fichas → "cancelada"
+2. Each CotizacionCerrada → estado = "rechazada" → all non-cancelled fichas → "cancelada"
+3. Each ficha in `fichas_directas` (curso_asociado=this course) → "cancelada"
+4. Recursively follows `cotizacion.recotizaciones` children
+All ficha saves use `_skip_signal=True` to prevent re-entrant signal loops.
+
+**FINALIZADO** — `CursoAgendado._completar_fichas()` (core/models.py line 968):
+- Fichas in `confirmada` or `en_proceso` → "completada"
+- Fichas in `pendiente` or `cancelada` are NOT touched (left as-is)
+
+**CONFIRMADO degradation** (logistica/signals.py line 163-181):
+When a ficha transitions to `cancelada` or `en_proceso` (reversal), if the course is CONFIRMADO and no longer meets minimum participants, the course degrades to PROSPECTADO.
+
+#### Ficha validation logic (confirmation requirements)
+
+`FichaInscripcionService.confirmar_ficha` (ficha_inscripcion_service.py line 22):
+1. `ficha.estado != "confirmada"` — not already confirmed
+2. `ficha.numero_participantes_actuales > 0` — at least one participant
+3. Zero incomplete participants: all must have `nombre`, `apellido_paterno`, `curp`, `puesto`, `genero` — no empty strings, no CURPs starting with "XXXX" or "TEMP"
+
+Only on passing all three is the ficha marked `confirmada`.
+
+---
+
+### 4. Rescheduling (Reagendamiento)
+
+#### What rescheduling is in this codebase
+
+There is NO REAGENDADO course state (it was removed — mentioned in CLAUDE.md). Rescheduling is implemented as a **date mutation** on the existing CursoAgendado via PATCH. The dedicated `/reagendar` endpoint was deprecated.
+
+Comment in `qsystem-backend/src/apps/logistica/views/cursos_logistica.py` (lines 193-195):
+```
+# [DEPRECATED] El endpoint /reagendar ha sido eliminado.
+# Use PATCH /core/cursos-agendados/{id}/ para actualizar fechas del curso existente.
+# El historial de reagendamiento se registra automáticamente.
+```
+
+#### Ficha deadline cascade on date change
+
+Signal: `actualizar_fecha_limite_fichas_al_reagendar` (`qsystem-backend/src/apps/core/signals.py` line 157)
+
+Triggers on `post_save` when `tracker.has_changed("fechai")`:
+1. For each `CotizacionCerrada` linked to this course: find earliest `fechai` among all courses in that cotización, then update `fecha_limite_inscripcion` on all non-confirmed/non-completed fichas
+2. For all `fichas_directas` (curso_asociado=this course) that are not confirmed/completed: set `fecha_limite_inscripcion = nueva_fechai`
+
+#### ficha_origen / curso_asociado pattern for rescheduled fichas
+
+When a participant confirms for a rescheduled course, a **new** FichaDeInscripcion is created:
+- `ficha_origen` = FK to the original ficha (self-referential, `on_delete=SET_NULL`)
+- `curso_asociado` = FK to the new CursoAgendado
+
+`FichaInscripcionService.confirmar_reagendamiento` validates both fields must be set before proceeding. After confirmation the service optionally changes the course from AGENDADO to PROSPECTADO if at least one ficha is confirmed.
+
+#### What changes when a course is rescheduled (date changed)?
+
+| Entity | Effect |
+|---|---|
+| FichaDeInscripcion | `fecha_limite_inscripcion` updated via signal (non-confirmed/completed only) |
+| Participantes | No effect |
+| Facturas | No effect — FK and estado preserved |
+| Cotizaciones | No effect — unless new dates push the course past thresholds triggering VENCIDO |
+| Course estado | May change automatically (CONFIRMADO → EN_PROCESO if fechai passed, or AGENDADO → VENCIDO if fechaf passed) |
+
+---
+
+### Critical Issues Found
+
+#### 1. Dual "aceptada" CotizacionAbierta — no guard
+**File**: `qsystem-backend/src/apps/ventas/models.py` (no uniqueness constraint)
+Two sellers can both have `estado="aceptada"` for quotations on the same CursoAgendado. The system would allow both to proceed to invoice generation.
+
+#### 2. Asymmetric course cancellation on rejection
+CotizacionCerrada rejection → CANCELADO (irreversible terminal state)
+CotizacionAbierta rejection → AGENDADO (recoverable)
+Operators must understand this asymmetry — mistakenly rejecting a cerrada quotation cannot be undone without admin intervention.
+
+#### 3. Invoices survive quotation rejection with no automatic action
+No cascade from quotation rejection to Factura estado. Invoices in "emitida" or "timbrada" remain active even after the underlying commercial transaction is cancelled. Requires manual intervention.
+
+#### 4. `ficha.curso_agendado` property returns only first course for cerrada fichas
+`logistica/models.py` line 642: `return self.cotizacion_cerrada.cursos_agendados.first()`
+Any logic using this property for multi-course quotations silently ignores courses after the first.
+
+#### 5. Participant deletion does NOT degrade course state
+`post_delete` on Participante only logs a warning — no automatic CONFIRMADO → PROSPECTADO degradation when participant count drops below minimum after a deletion.
+
+---
+
+## References
+
+### Key Files for This Analysis
+- `qsystem-backend/src/apps/ventas/signals.py` — lines 10-85 (open rejection "last rejection" logic), lines 141-159 (closed rejection → CANCELADO), lines 209-238 (pre_add exclusivity guard)
+- `qsystem-backend/src/apps/ventas/views.py` — lines 825-838 (ficha cancel on cerrada rejection), lines 1865-1878 (ficha cancel on abierta rejection)
+- `qsystem-backend/src/apps/ventas/models.py` — lines 134 and 418 (TRANSICIONES_VALIDAS for both types)
+- `qsystem-backend/src/apps/logistica/models.py` — lines 103-648 (FichaDeInscripcion model, constraints, properties)
+- `qsystem-backend/src/apps/logistica/services/ficha_inscripcion_service.py` — full file (all ficha state transitions and reagendamiento confirmation)
+- `qsystem-backend/src/apps/contabilidad/models.py` — lines 10-277 (Factura, ItemFactura — no FacturaPartida)
+- `qsystem-backend/src/apps/core/models.py` — lines 815-1000 (cambiar_estado, _cancelar_relacionados, _completar_fichas)
+- `qsystem-backend/src/apps/core/signals.py` — lines 157-235 (fecha_limite cascade on reagendamiento)
+- `qsystem-backend/src/apps/core/tests/test_cascading_cancellation.py` — full file (test coverage for cascade)
+
+---
+
+**Next Steps**:
+1. Decide whether dual-accepted open quotations need a DB-level partial unique index or application-level guard in `cambiar_estado`.
+2. Clarify with accounting team: should rejecting a quotation automatically void associated unpaid invoices?
+3. Evaluate adding a `cursos_agendados` M2M to FichaDeInscripcion to replace the fragile `.first()` property for cerrada fichas.
+
+---
+
+## Part 1: Original Analysis (preserved below)
+
 
 ---
 
 ## Executive Summary
 
-The Management area (`/management/*`) is a two-level tabbed admin interface. The top level has six tabs: Dashboard, General, Ventas, Logistica, Contabilidad, and Variables. Each tab renders a second-level grid of sub-sections. All sub-sections except the Variables key-value config pages are built on a shared `SectionBase` component (paginated table + modal form + trash mode).
+The QSystem backend implements a tightly coupled, event-driven state machine across four interdependent modules: `core` (CursoAgendado), `ventas` (CotizacionCerrada / CotizacionAbierta / ItemCotizacionCerrada), `logistica` (FichaDeInscripcion / Participante), and `contabilidad` (Factura / ItemFactura). State changes in one entity cascade to multiple others through a combination of Django signals, model methods, and service-layer logic.
 
-There are exactly **35 distinct management sections** in total. They fall into three categories:
-- **CATALOG** — reference data that rarely changes and is used as dropdown/lookup values across the system (e.g., Cursos Catálogo, Plazas, Tipos de Material).
-- **OPERATIONAL** — records created and modified daily as business transactions occur (e.g., Cursos Agendados, Cotizaciones, Facturas).
-- **SYSTEM CONFIG** — key-value pairs stored in `ConfiguracionSistema` that control business rule parameters (discount percentages, pricing factors) plus infrastructure settings (email/Graph API credentials, import jobs, catalog lookup tables for classification/department/area).
+The central orchestrator is `CursoAgendado`: its state drives downstream changes to quotations, enrollment forms, and ultimately invoices. Quotation acceptance (both open and closed types) triggers automated creation of CursoAgendado records and links them to FichaDeInscripcion records. The FichaDeInscripcion model implements a secondary enrollment lifecycle that reflects and influences the course state through participant counts. The Factura model sits at the terminus of this flow, referencing cotizaciones directly and remaining structurally independent from state cascades once created.
 
-A routing mismatch is worth noting: the `VariablesTab` navigation tile for "Clasificaciones", "Departamentos", and "Áreas Temáticas" points to paths under `/management/variables/*`, but the section components for those three entities live physically in `src/pages/management/sections/general/` and use the shared `CatalogosTable`/`CatalogoForm`. This means they are catalog/reference data accidentally housed under the Variables tab.
+A critical design note: the system has two parallel quotation types — CotizacionAbierta (for open/catalog courses, direct FK to CursoAgendado) and CotizacionCerrada (for closed/private courses, M2M to CursoAgendado). Both share identical ESTADO_CHOICES and TRANSICIONES_VALIDAS logic, but their cascade behaviors differ in important ways documented below.
 
 ---
 
-## Project Architecture (relevant scope)
+## Project Architecture
 
 ### Technology Stack
-- **Frontend**: React 18, Vite, React Router v6, Tailwind CSS, React Bootstrap, react-toastify
-- **State**: React Context (AuthContext, TrashModeContext, ThemeContext, QuotationContext)
-- **API Layer**: Axios with interceptors (`src/api/axios.jsx`), per-module API files
-- **Backend**: Django REST Framework, PostgreSQL, JWT auth (HttpOnly cookies)
+- **Backend**: Django + Django REST Framework, PostgreSQL 15
+- **Key Libraries**: simple-history (audit trail on CursoAgendado), model-utils FieldTracker (CursoAgendado), django-filter, django.db.transaction with select_for_update throughout
+- **Infrastructure**: Docker, docker-compose
 
-### Directory Structure (management-relevant)
+### Directory Structure
 ```
-qsystem-frontend/src/
-├── pages/management/
-│   ├── ManagementLayout.jsx          # Top-level shell with tab nav
-│   ├── tabs/
-│   │   ├── GeneralTab.jsx            # 9 sub-sections
-│   │   ├── VentasTab.jsx             # 2 sub-sections
-│   │   ├── LogisticaTab.jsx          # 10 sub-sections
-│   │   ├── ContabilidadTab.jsx       # 4 sub-sections
-│   │   └── VariablesTab.jsx          # 8 sub-sections
-│   └── sections/
-│       ├── SectionBase.jsx           # Shared table+form+pagination wrapper
-│       ├── general/                  # 12 section files (9 in nav + 3 misrouted from Variables)
-│       ├── ventas/                   # 2 section files
-│       ├── logistica/                # 10 section files
-│       ├── contabilidad/             # 4 section files
-│       └── variables/                # 5 section files
-├── components/
-│   └── ui/VariablesManager.jsx       # Key-value config editor (used by 3 Variables sub-sections)
-└── api/
-    ├── configuration.jsx             # /core/configuracion/ CRUD + por-modulo endpoint
-    ├── courseClassifications.jsx     # /core/clasificaciones-curso/
-    ├── departments.jsx               # /core/departamentos/
-    ├── areasThematic.jsx             # /core/areas-tematicas/
-    ├── logistics.jsx                 # fichas, tipos material, ocupaciones, diplomas, formatos, costos, materiales
-    ├── accounting.jsx                # facturas, pagos, notas credito, comprobantes gasto
-    ├── quotations.jsx                # cotizaciones abiertas + cerradas
-    ├── imports.jsx                   # import jobs
-    └── mailings.jsx                  # email config, test, history
-
-qsystem-backend/src/apps/core/
-├── models.py                         # ConfiguracionSistema (key-value store)
-├── views/configuracion.py            # ViewSet with por-modulo, actualizar-multiple, inicializar-variables-ventas
-└── management/commands/initialize_sales_variables.py  # Seeds 23 sales variables
+qsystem-backend/src/apps/
+├── core/
+│   ├── models.py             # CursoAgendado, CursoCatalogo, BaseModel, ConfiguracionSistema
+│   ├── signals.py            # CursoAgendado pre/post_save, m2m_changed (plazas, materiales)
+│   ├── services/
+│   │   └── curso_agendado_service.py   # reagendar_simple, transfer_relationships, etc.
+│   └── views/cursos_agendados.py       # CursoAgendadoViewSet
+├── ventas/
+│   ├── models.py             # CotizacionCerrada, ItemCotizacionCerrada, CotizacionAbierta
+│   ├── signals.py            # post_save/post_delete on both cotizacion types, m2m_changed
+│   └── views.py              # CotizacionCerradaViewSet, CotizacionAbiertaViewSet
+├── logistica/
+│   ├── models.py             # FichaDeInscripcion, Participante, Costo, ServicioReceso
+│   ├── signals.py            # post_save on Participante and FichaDeInscripcion
+│   ├── services/
+│   │   └── ficha_inscripcion_service.py
+│   └── views/fichas_inscripcion.py
+└── contabilidad/
+    ├── models.py             # Factura, ItemFactura, Pago, NotaCredito, ComprobanteGasto
+    └── views.py              # FacturaViewSet
 ```
 
 ---
 
-## Complete Section Map
-
-### TAB: General (9 visible sub-sections in nav)
-
-| # | Section UI Label | Entity (Spanish) | Entity (English) | Data Type | Logical Module | File |
-|---|---|---|---|---|---|---|
-| 1 | Cursos Agendados | CursoAgendado | Scheduled Course | OPERATIONAL | General/Core | `sections/general/CursosAgendadosSection.jsx` |
-| 2 | Cursos Catálogo | CursoCatalogo | Catalog Course | CATALOG | General/Core | `sections/general/CursosCatalogoSection.jsx` |
-| 3 | Clientes | Cliente | Client (individual person) | CATALOG | General/Core | `sections/general/ClientesSection.jsx` |
-| 4 | Empresas | Empresa | Company/Organization | CATALOG | General/Core | `sections/general/EmpresasSection.jsx` |
-| 5 | Plazas | Plaza | Sales Territory/Region | CATALOG | General/Core | `sections/general/PlazasSection.jsx` |
-| 6 | Lugares | Lugar | Physical Location/Venue | CATALOG | General/Core | `sections/general/LugaresSection.jsx` |
-| 7 | Instructores | Instructor | Instructor (User subtype) | CATALOG | General/Core | `sections/general/InstructoresSection.jsx` |
-| 8 | Vendedores | Vendedor | Seller (User subtype) | CATALOG | General/Core | `sections/general/VendedoresSection.jsx` |
-| 9 | Administradores | Administrador | Admin (User subtype) | CATALOG | General/Core | `sections/general/AdministradoresSection.jsx` |
-
-**Detail per General section:**
-
-#### Cursos Agendados
-- Entity: `CursoAgendado` — a specific scheduled instance of a catalog course, with dates, instructor(s), location, modality.
-- Type: OPERATIONAL — new scheduled courses are created for every training session sold or planned.
-- API function: `getScheduledCourses` from `@/api/scheduledCourses`
-- Components: `ScheduledCoursesTable` + `ScheduledCourseForm`
-
-#### Cursos Catálogo
-- Entity: `CursoCatalogo` — the master course definition (name, duration, base price, classification, area tematica).
-- Type: CATALOG — grows slowly; used as a dropdown/reference in Scheduled Courses and Quotations.
-- API function: `getCatalogCourses` from `@/api/catalogCourses`
-- Components: `CatalogCoursesTable` + `CatalogCourseForm`
-- Note: The form references Clasificaciones, Departamentos, Áreas Temáticas as dropdowns, making those true catalog dependencies.
-
-#### Clientes
-- Entity: `Cliente` — an individual person (contact) who may belong to an `Empresa`.
-- Type: CATALOG — grows as new contacts are added; used in Quotations, Fichas de Inscripción.
-- API function: `getClients` from `@/api/clients`
-- Components: `ClientsTable` + `ClientForm`
-
-#### Empresas
-- Entity: `Empresa` — a company/organization that contracts training.
-- Type: CATALOG — grows as new client organizations are added.
-- API function: `getCompanies` from `@/api/companies`
-- Components: `CompaniesTable` + `CompanyForm`
-
-#### Plazas
-- Entity: `Plaza` — a geographic sales territory or region (e.g. "Monterrey", "CDMX").
-- Type: CATALOG — rarely changes; used to categorize Cursos Agendados and Cotizaciones.
-- API function: `getSalesTerritories` from `@/api/salesTerritories`
-- Components: `SalesTerritoriesTable` + `SalesTerritoryForm`
-
-#### Lugares
-- Entity: `Lugar` — a physical venue or address where courses take place.
-- Type: CATALOG — grows as new venues are added; referenced in Cursos Agendados.
-- API function: `getLocations` from `@/api/locations`
-- Components: `LocationsTable` + `LocationForm`
-
-#### Instructores
-- Entity: `Instructor` — a user account with the instructor role, including availability schedules.
-- Type: CATALOG — grows as staff is hired; assigned to Cursos Agendados.
-- API function: `getInstructors` from `@/api/instructors`
-- Components: `InstructorsTable` + `InstructorForm`
-
-#### Vendedores
-- Entity: `Vendedor` — a user account with the seller role.
-- Type: CATALOG — grows as sales staff is hired; linked to Cotizaciones.
-- API function: `getSellers` from `@/api/sellers`
-- Components: `SellersTable` + `SellerForm`
-
-#### Administradores
-- Entity: `Administrador` — a user account with the admin role (`role=admin`).
-- Type: CATALOG — system administrators.
-- API function: `getUsers({role: "admin"})` from `@/api/users`
-- Components: `AdminsTable` + `AdminForm`
+## Detailed Analysis
 
 ---
 
-### TAB: Ventas (2 sub-sections)
+### 1. CursoAgendado
 
-| # | Section UI Label | Entity | Data Type | Logical Module | File |
-|---|---|---|---|---|---|
-| 1 | Cotizaciones Abiertas | CotizacionAbierta | OPERATIONAL | Ventas | `sections/ventas/CotizacionesAbiertasSection.jsx` |
-| 2 | Cotizaciones Cerradas | CotizacionCerrada | OPERATIONAL | Ventas | `sections/ventas/CotizacionesCerradasSection.jsx` |
+**Location**: `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/core/models.py` line 516
 
-**Detail:**
+**State Choices (ESTADO_CHOICES)**:
+```
+AGENDADO      -> Course exists but has no quotations
+PROSPECTADO   -> Has at least one active quotation
+CONFIRMADO    -> Has accepted quotations or reached min participants
+EN_PROCESO    -> Currently executing (fechai reached)
+FINALIZADO    -> Completed (terminal)
+CANCELADO     -> Cancelled definitively (terminal)
+VENCIDO       -> fechai passed without confirmation
+```
 
-#### Cotizaciones Abiertas
-- Entity: Open-format quotations (flexible, not yet accepted/rejected). A distinct model from "Cerradas".
-- Type: OPERATIONAL — created daily by sellers when prospecting clients.
-- API function: `getCotizacionesAbiertas` from `@/api/quotations`
-- Components: `OpenQuotationsTable` + `OpenQuotationForm`
+**Valid State Transitions (inside cambiar_estado() method)**:
+```
+AGENDADO     -> [PROSPECTADO, CANCELADO, VENCIDO]
+PROSPECTADO  -> [CONFIRMADO, CANCELADO, VENCIDO, AGENDADO]
+CONFIRMADO   -> [EN_PROCESO, CANCELADO, PROSPECTADO, AGENDADO]
+EN_PROCESO   -> [FINALIZADO, CANCELADO]
+FINALIZADO   -> []   (terminal)
+CANCELADO    -> []   (terminal)
+VENCIDO      -> [CONFIRMADO, AGENDADO, CANCELADO]
+```
 
-#### Cotizaciones Cerradas
-- Entity: `CotizacionCerrada` — finalized quotations with status lifecycle (borrador → enviada → aceptada/rechazada/vencida). These are the main quotation model with `PartidaCotizacion` line items.
-- Type: OPERATIONAL — created when a quotation is confirmed/closed.
-- API function: `getCotizacionesCerradas` from `@/api/quotations`
-- Components: `ClosedQuotationsTable` + `ClosedQuotationForm`
+**Key Fields**:
+- tipo_curso: "abierto" | "cerrado" determines which cotizacion relationship to follow
+- historial_cambios_estado (JSONField): full audit log with fecha, usuario, estado_anterior, estado_nuevo, motivo, tipo
+- historial_reagendamientos, historial_cambios_instructor, historial_cambios_ubicacion, historial_cambios_plaza, historial_cambios_materiales: separate JSON audit fields
+- veces_reagendado, ultima_fecha_reagendamiento: rescheduling counters
+- min_participantes_confirmacion (default 5): threshold for auto-confirmation via participants
+- tracker = FieldTracker(fields=["fechai", "fechaf", "instructor"]): used in pre_save signal
+
+**Foreign Key Relationships (outgoing)**:
+- curso -> CursoCatalogo (CASCADE)
+- instructor -> Instructor (CASCADE, nullable)
+- lugar_curso -> LugarCurso (CASCADE, nullable)
+- plaza -> M2M to Plaza
+- usuario_cambio_estado -> User (SET_NULL)
+- usuario_ultimo_reagendamiento -> User (SET_NULL)
+- usuario_eliminacion -> User (SET_NULL)
+- materiales_seleccionados -> M2M to logistica.MaterialCursoCatalogo
+
+**Reverse Relationships (incoming)**:
+- cotizaciones_abiertas <- CotizacionAbierta.curso (SET_NULL)
+- cotizaciones_cerradas <- CotizacionCerrada.cursos_agendados (M2M)
+- fichas_directas <- FichaDeInscripcion.curso_asociado (SET_NULL)
+- comprobantes_gasto <- ComprobanteGasto.curso_agendado
+
+**cambiar_estado(nuevo_estado, motivo, usuario)**:
+- Acquires select_for_update() lock, re-reads current state from DB before validating
+- Appends to historial_cambios_estado JSON array
+- On CANCELADO: calls _cancelar_relacionados()
+- On FINALIZADO: calls _completar_fichas()
+
+**_cancelar_relacionados()**:
+- Sets all CotizacionAbierta linked to this course -> estado="rechazada" (unless already rechazada)
+- Sets all FichaDeInscripcion on those cotizaciones -> estado="cancelada" (_skip_signal=True)
+- Follows cotizacion.recotizaciones chain recursively, cancelling children too
+- Same logic for CotizacionCerrada (via M2M)
+- Also cancels fichas_directas (rescheduled fichas linked directly to this course)
+
+**_completar_fichas()**:
+- Fichas in "confirmada" or "en_proceso" -> "completada" (_skip_signal=True)
+- Covers fichas via CotizacionAbierta, CotizacionCerrada, and fichas_directas
+
+**actualizar_estado_automatico()**:
+- Programmatic method (called explicitly, not via signal)
+- VENCIDO if past fechaf and in AGENDADO/PROSPECTADO
+- FINALIZADO if past fechaf and in CONFIRMADO/EN_PROCESO
+- CONFIRMADO if PROSPECTADO and has accepted cotizacion
+- EN_PROCESO if CONFIRMADO and fechai reached
+
+**verificar_vencimiento()**:
+- Called on every list and retrieve API call
+- Transitions AGENDADO/PROSPECTADO -> VENCIDO if fechai < today
+
+**transfer_relationships(nuevo_curso, opciones)**:
+- For "abierto": bulk-updates CotizacionAbierta.curso FK to new course; reactivates "vencida" quotations
+- For "cerrado": M2M adds existing CotizacionCerrada to new course
+- Fichas are NOT transferred; they remain with their cotizaciones (which now point to new course)
+- Optionally copies "autorizado" Costo records (deep clone)
+
+**Visibility Properties**:
+- visible_en_logistica: True unless CANCELADO or FINALIZADO
+- visible_en_contabilidad: True only if (CONFIRMADO|EN_PROCESO|FINALIZADO) AND tiene_compromisos_economicos
 
 ---
 
-### TAB: Logistica (10 sub-sections)
+### 2. CotizacionCerrada / ItemCotizacionCerrada
 
-| # | Section UI Label | Entity | Data Type | Logical Module | File |
-|---|---|---|---|---|---|
-| 1 | Fichas de Cotizaciones Abiertas | FichaInscripcionAbierta | OPERATIONAL | Logistica | `sections/logistica/FichasAbiertasSection.jsx` |
-| 2 | Fichas de Cotizaciones Cerradas | FichaInscripcionCerrada | OPERATIONAL | Logistica | `sections/logistica/FichasCerradasSection.jsx` |
-| 3 | Costos | Costo | OPERATIONAL | Logistica | `sections/logistica/CostosSection.jsx` |
-| 4 | Participantes | Participante | OPERATIONAL | Logistica | `sections/logistica/ParticipantesSection.jsx` |
-| 5 | Diplomas y Constancias | Diploma | OPERATIONAL | Logistica | `sections/logistica/DiplomasSection.jsx` |
-| 6 | Formatos de Asistencia | FormatoAsistencia | OPERATIONAL | Logistica | `sections/logistica/FormatosAsistenciaSection.jsx` |
-| 7 | Tipos de Material | TipoMaterial | CATALOG | Logistica | `sections/logistica/TiposMaterialSection.jsx` |
-| 8 | Ocupaciones Específicas | OcupacionEspecifica | CATALOG | Logistica | `sections/logistica/OcupacionesEspecificasSection.jsx` |
-| 9 | Recesos | Receso | CATALOG/OPERATIONAL | Logistica | `sections/logistica/RecesosSection.jsx` |
-| 10 | Materiales Entregados | MaterialEntregado | OPERATIONAL | Logistica | `sections/logistica/MaterialesEntregadosSection.jsx` |
+**Location**: `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/ventas/models.py` line 87
 
-**Detail:**
+**State Choices (ESTADOS)**:
+```
+borrador    -> Initial draft state
+realizada   -> PDF uploaded; formally issued
+enviada     -> Sent to client via email
+aceptada    -> Client accepted
+rechazada   -> Rejected or cancelled
+recotizada  -> Superseded by a new quotation (terminal)
+vencida     -> Expired
+```
 
-#### Fichas de Cotizaciones Abiertas
-- Entity: `FichaInscripcionAbierta` — a registration/enrollment form linked to an open quotation. Tracks participants, logistics, status.
-- Type: OPERATIONAL — created as part of the sales-to-delivery pipeline for open courses.
-- API function: `getFichasInscripcionAbiertas` from `@/api/logistics`
-- Components: `FichasInscripcionAbiertasTable` + `FichaInscripcionForm`
+**Valid State Transitions (TRANSICIONES_VALIDAS)**:
+```
+borrador    -> [realizada]
+realizada   -> [enviada, rechazada, recotizada]
+enviada     -> [aceptada, rechazada, recotizada]
+rechazada   -> [recotizada]
+recotizada  -> []   (terminal)
+aceptada    -> [rechazada]
+vencida     -> [realizada]   (reactivation after rescheduling)
+```
 
-#### Fichas de Cotizaciones Cerradas
-- Entity: `FichaInscripcionCerrada` — same structure but linked to a closed/confirmed quotation. Main logistics record for a confirmed training engagement.
-- Type: OPERATIONAL — status lifecycle: pendiente → en_proceso → confirmada → completada → cancelada.
-- API function: `getFichasInscripcionCerradas` from `@/api/logistics`
-- Components: `FichasInscripcionCerradasTable` + `FichaInscripcionForm`
+**Foreign Key Relationships**:
+- cliente -> core.Cliente (CASCADE)
+- recotizada_de -> self (SET_NULL): recotizacion chain
+- cursos_agendados -> M2M to core.CursoAgendado (related_name="cotizaciones_cerradas")
+- curso_agendado_original -> core.CursoAgendado (SET_NULL): desvinculacion audit reference
+- items <- ItemCotizacionCerrada.cotizacion (CASCADE, related_name="items")
+- fichas_inscripcion <- FichaDeInscripcion.cotizacion_cerrada (CASCADE)
+- facturas <- Factura.cotizacion_cerrada (SET_NULL)
+- autorizaciones_descuento <- AutorizacionDescuento.cotizacion_cerrada
 
-#### Costos
-- Entity: `Costo` — an individual cost line item associated with a `CursoAgendado`. Has `tipo` (type of cost) and `estado` filters.
-- Type: OPERATIONAL — recorded per course execution (instructor fees, venue, materials, food, etc.).
-- Special: Custom implementation (not SectionBase) with tipo/estado/curso filters. Uses `COSTO_TIPOS` and `COSTO_ESTADOS` from `src/components/modals/CursoDetalle/constants/costoTypes`.
-- API function: `getCostos` from `@/api/logistics`
-- Components: `CostosTable` + `CostoForm`
+**ItemCotizacionCerrada Key Fields**:
+- cotizacion -> CotizacionCerrada (CASCADE)
+- curso -> CursoCatalogo (CASCADE)
+- precio_unitario, num_participantes, num_grupos, descuento_porcentaje, descuento_monto, precio_subtotal
+- fecha_propuesta_inicio, fecha_propuesta_fin, duracion, lugar, modalidad
+- incluye_desayuno, incluye_comida, incluye_coffee, incluye_material, incluye_diploma
+- save() triggers cotizacion.calcular_totales() atomically with select_for_update()
 
-#### Participantes
-- Entity: `Participante` — an attendee enrolled in a specific `FichaInscripcion`.
-- Type: OPERATIONAL — entered per course per client.
-- Special: Requires selecting a `FichaInscripcion` first (two-level lookup). Custom implementation, not SectionBase.
-- API functions: `getFichasInscripcion` (ficha dropdown) + `getParticipantesFicha(fichaId)` from `@/api/logistics`
-- Components: `ParticipantesTable` + `ParticipanteForm`
+**State Transition Logic via API Actions**:
 
-#### Diplomas y Constancias
-- Entity: `Diploma` — a diploma or certificate issued to a participant after course completion.
-- Type: OPERATIONAL — generated individually or in bulk ("Generar Masivo" button via `DiplomaGenerarMasivoModal`).
-- API function: `getDiplomas` from `@/api/logistics`
-- Components: `DiplomasTable` + `DiplomaForm` + `DiplomaGenerarMasivoModal`
+upload_pdf action:
+- Only valid when estado="borrador"
+- Saves PDF file and transitions borrador -> realizada
 
-#### Formatos de Asistencia
-- Entity: `FormatoAsistencia` — an attendance record for a course session.
-- Type: OPERATIONAL — created per course session; tracks who attended.
-- API function: `getFormatosAsistencia` from `@/api/logistics`
-- Components: `FormatosAsistenciaTable` + `FormatoAsistenciaForm`
+send_email action:
+- Only valid when estado in ["realizada", "enviada"]
+- On email success: transitions to "enviada"
 
-#### Tipos de Material
-- Entity: `TipoMaterial` — a reference category for materials (e.g., "Manual", "USB", "Cuaderno").
-- Type: CATALOG — small, rarely-changing list; used as a dropdown in material records.
-- API function: `getTiposMaterial` from `@/api/logistics`
-- Components: `TiposMaterialTable` + `TipoMaterialForm`
+cambiar_estado action - transitioning to "aceptada":
+- Creates one CursoAgendado per ItemCotizacionCerrada per num_grupos
+- Created courses: tipo_curso="cerrado", estado="CONFIRMADO"
+- If fechai already passed: immediately transitions created course to EN_PROCESO
+- Links all created courses via cotizacion.cursos_agendados.add()
 
-#### Ocupaciones Específicas
-- Entity: `OcupacionEspecifica` — a specific job title/occupation for participants (e.g., "Operador de Montacargas").
-- Type: CATALOG — reference list used in participant registration.
-- API function: `getOcupacionesEspecificas` from `@/api/logistics`
-- Components: `OcupacionesEspecificasTable` + `OcupacionEspecificaForm`
+cambiar_estado action - "aceptada" -> "rechazada":
+- Soft-deletes all FichaDeInscripcion on this cotizacion
+- Sets ficha.estado="cancelada"
 
-#### Recesos
-- Entity: `Receso` (UI title: "Recesos de Curso") — a scheduled break period within a course session (lunch, coffee break, etc.).
-- Type: CATALOG/OPERATIONAL — ambiguous. The dedicated `@/api/recesos` module (separate from logistics) and Logistica tab placement suggest it is per-course-instance. Could be templates or actual records.
-- API function: `getRecesos` from `@/api/recesos`
-- Components: `RecesosTable` + `RecesoForm`
+cambiar_estado action - any state -> "realizada" (reactivation path):
+- If soft-deleted fichas exist: restores them
+- Sets ficha.estado to "en_proceso" (if has participants) or "pendiente"
+- IMPORTANT: overrides nuevo_estado to "aceptada" if fichas were restored
 
-#### Materiales Entregados
-- Entity: `MaterialEntregado` — a record of a specific material item delivered to a participant or course.
-- Type: OPERATIONAL — recorded per course delivery to track what was handed out.
-- API function: `getMaterialesEntregados` from `@/api/logistics`
-- Components: `MaterialesEntregadosTable` + `MaterialEntregadoForm`
+duplicar action (es_recotizacion=True):
+- Marks original cotizacion as "recotizada"
+- Soft-deletes all fichas on original
+- Creates new CotizacionCerrada with recotizada_de reference, estado="realizada"
+- Duplicates all items
+
+**M2M Signal Constraints (ventas/signals.py)**:
+- pre_add: validates no course already belongs to another active CotizacionCerrada
+- pre_add: validates courses match a CursoCatalogo in the cotizacion's items
+- post_add: advances AGENDADO courses -> PROSPECTADO
 
 ---
 
-### TAB: Contabilidad (4 sub-sections)
+### 3. CotizacionAbierta
 
-| # | Section UI Label | Entity | Data Type | Logical Module | File |
-|---|---|---|---|---|---|
-| 1 | Facturas | Factura | OPERATIONAL | Contabilidad | `sections/contabilidad/FacturasSection.jsx` |
-| 2 | Pagos | Pago | OPERATIONAL | Contabilidad | `sections/contabilidad/PagosSection.jsx` |
-| 3 | Notas de Credito | NotaCredito | OPERATIONAL | Contabilidad | `sections/contabilidad/NotasCreditoSection.jsx` |
-| 4 | Comprobantes de Gasto | ComprobanteGasto | OPERATIONAL | Contabilidad | `sections/contabilidad/ComprobantesGastoSection.jsx` |
+**Location**: `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/ventas/models.py` line 372
 
-**Detail:**
+**State Choices and Transitions**: Identical to CotizacionCerrada.
 
-#### Facturas
-- Entity: `Factura` — an invoice issued to a client, likely linked to a `CotizacionCerrada`.
-- Type: OPERATIONAL — created per billing cycle; financial document.
-- API function: `getFacturas` from `@/api/accounting`
-- Components: `FacturasTable` + `FacturaForm`
+**Key Differences from CotizacionCerrada**:
+- Single curso FK (not M2M) -> CursoAgendado (SET_NULL)
+- precio_total calculated inline in save() using num_participantes and descuento_porcentaje
+- Group discount applied automatically when num_participantes >= 2 (Factor 1 from ConfiguracionSistema)
+- fecha_vencimiento defaults to curso.fechai if available
+- clean() prevents reassigning to a CursoAgendado of a different CursoCatalogo
+- Multiple CotizacionAbierta can reference the same CursoAgendado (multi-seller model)
 
-#### Pagos
-- Entity: `Pago` — a payment record against a factura or cotizacion.
-- Type: OPERATIONAL — registered as money is received.
-- API function: `getPagos` from `@/api/accounting`
-- Components: `PagosTable` + `PagoForm`
-
-#### Notas de Credito
-- Entity: `NotaCredito` — a credit note issued as adjustment against a factura.
-- Type: OPERATIONAL — created when a refund or billing adjustment occurs.
-- API function: `getNotasCredito` from `@/api/accounting`
-- Components: `NotasCreditoTable` + `NotaCreditoForm`
-
-#### Comprobantes de Gasto
-- Entity: `ComprobanteGasto` — an expense voucher/receipt (cost side, e.g. reimbursements or vendor invoices).
-- Type: OPERATIONAL — recorded per expense event.
-- API function: `getComprobantesGasto` from `@/api/accounting`
-- Components: `ComprobantesGastoTable` + `ComprobanteGastoForm`
+**Signal Behavior (ventas/signals.py)**:
+- Created + AGENDADO -> PROSPECTADO
+- estado="aceptada" -> chain AGENDADO -> PROSPECTADO -> CONFIRMADO
+- estado="rechazada" + no other active cotizaciones -> AGENDADO (downgrade, NOT CANCELADO)
+- post_delete: last cotizacion deleted -> PROSPECTADO reverts to AGENDADO
 
 ---
 
-### TAB: Variables (8 sub-sections)
+### 4. FichaDeInscripcion
 
-| # | Section UI Label | Entity | Data Type | Logical Module | File |
-|---|---|---|---|---|---|
-| 1 | Ventas | ConfiguracionSistema (modulo=ventas) | SYSTEM CONFIG | Ventas | `sections/variables/VentasVariablesSection.jsx` |
-| 2 | Logística | ConfiguracionSistema (modulo=logistica) | SYSTEM CONFIG | Logistica | `sections/variables/LogisticaVariablesSection.jsx` |
-| 3 | Contabilidad | ConfiguracionSistema (modulo=contabilidad) | SYSTEM CONFIG | Contabilidad | `sections/variables/ContabilidadVariablesSection.jsx` |
-| 4 | Email | TenantGraphConfig + UserEmailPreferences + EmailLog | SYSTEM CONFIG | Infrastructure | `sections/variables/EmailConfigSection.jsx` |
-| 5 | Importaciones | ImportJob | OPERATIONAL | Infrastructure | `sections/variables/ImportacionesSection.jsx` |
-| 6 | Clasificaciones | ClasificacionCurso | CATALOG | General/Core | `sections/general/ClasificacionesSection.jsx` (routed under /management/variables/) |
-| 7 | Departamentos | Departamento | CATALOG | General/Core | `sections/general/DepartamentosSection.jsx` (routed under /management/variables/) |
-| 8 | Áreas Temáticas | AreaTematica | CATALOG | General/Core | `sections/general/AreasTematicasSection.jsx` (routed under /management/variables/) |
+**Location**: `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/logistica/models.py` line 103
 
-**Detail:**
+**State Choices (ESTADO_CHOICES)**:
+```
+pendiente    -> Created, no participants yet
+en_proceso   -> Participants being added
+confirmada   -> All required data complete; confirmed
+completada   -> Course finished (terminal, set by _completar_fichas)
+cancelada    -> Cancelled (reversible unless cotizacion also cancelled)
+```
 
-#### Variables - Ventas
-- Entity: `ConfiguracionSistema` records where `modulo = 'ventas'`
-- Type: SYSTEM CONFIG — key-value pairs controlling pricing rules. Currently two sections are seeded:
-  - **Factores de Ajuste de Precio** (9 variables): `factor_1_porcentaje` through `factor_9_cantidad` — percentages and monetary amounts controlling how course prices are calculated (extra participants, foraneo markup, hour adjustments, food prices).
-  - **Descuentos por Número de Participantes** (14 variables): `descuento_6_menos_local`, `descuento_7_9_local`, etc. — volume-based discount percentages for local/virtual and foraneo modalities.
-- UI: `VariablesManager` renders an inline editable table grouped by section. Supports batch save (`actualizar-multiple` API), discard, and one-click initialize (for first-time setup via `inicializar-variables-ventas`).
-- Backend: `ConfiguracionSistemaViewSet` at `/core/configuracion/`, `por-modulo/ventas/` endpoint.
-- Seed: `initialize_sales_variables` management command seeds all 23 variables.
+**ESTADO_INSCRIPCION_CHOICES** (tracks data completeness separately from workflow state):
+```
+sin_iniciar  -> No participant data entered
+parcial      -> Some participants have data
+completa     -> All expected participants have full required data
+```
 
-#### Variables - Logística
-- Entity: `ConfiguracionSistema` records where `modulo = 'logistica'`
-- Type: SYSTEM CONFIG — parameters controlling logistics module behavior.
-- Note: No seed command exists. Empty state shows "No hay variables configuradas" until manually populated.
-- UI: Same `VariablesManager` component.
+**Foreign Key Relationships**:
+- cotizacion_abierta -> ventas.CotizacionAbierta (CASCADE, nullable)
+- cotizacion_cerrada -> ventas.CotizacionCerrada (CASCADE, nullable)
+- ficha_origen -> self (SET_NULL): rescheduling chain, original ficha
+- curso_asociado -> core.CursoAgendado (SET_NULL): direct link for rescheduled fichas
+- participantes <- Participante.ficha_inscripcion (CASCADE)
 
-#### Variables - Contabilidad
-- Entity: `ConfiguracionSistema` records where `modulo = 'contabilidad'`
-- Type: SYSTEM CONFIG — parameters controlling accounting module behavior.
-- Note: Same as Logística — no seed command exists.
+**DB Constraint**: logistica_ficha_una_sola_cotizacion - exactly ONE of cotizacion_abierta or cotizacion_cerrada must be non-null (enforced at DB CheckConstraint level AND model.clean()).
 
-#### Variables - Email
-- Entity: Microsoft Graph API credentials (`TenantGraphConfigForm`) + per-user email preferences (`UserEmailPreferencesForm`) + email send history log.
-- Type: SYSTEM CONFIG — infrastructure configuration for the email system (Azure tenant ID, client ID, client secret).
-- Custom implementation (not using `VariablesManager`) — renders 4 cards: status/test buttons, graph config form, preferences form, history table.
-- API functions: `getEmailConfigStatus`, `testConnection`, `sendTestEmail`, `getEmailHistory` from `@/api/mailings`
+**Computed Properties**:
+- cotizacion: returns whichever FK is set
+- tipo: "abierto" | "cerrado"
+- curso_agendado: for abiertas -> cotizacion_abierta.curso; for cerradas -> cotizacion_cerrada.cursos_agendados.first()
+- numero_participantes_actuales: count of active Participantes
+- numero_participantes_con_datos: count with all required fields (nombre, apellido, CURP, puesto, genero); excludes CURP starting with "XXXX" or "TEMP"
+- esta_completa: numero_participantes_actuales >= num_participantes_esperados
 
-#### Variables - Importaciones
-- Entity: `ImportJob` — a CSV/Excel bulk import job tracking file, status, rows processed, errors.
-- Type: OPERATIONAL (admin-initiated) — jobs are queued and processed asynchronously via `process_imports` management command. Status: pendiente → procesando → completado → error.
-- Uses standard `SectionBase` pattern.
-- API function: `getImportJobs` from `@/api/imports`
-- Components: `ImportJobsTable` + `ImportJobForm`
+**FichaInscripcionService State Transitions**:
 
-#### Variables - Clasificaciones
-- Entity: `ClasificacionCurso` — a course classification label (e.g., "Seguridad Industrial", "Calidad").
-- Type: CATALOG — small reference list used as dropdown in `CatalogCourseForm`.
-- Backend: `/core/clasificaciones-curso/`
-- Physical file: `sections/general/ClasificacionesSection.jsx` (misrouted under Variables tab)
-- UI: Shared `CatalogosTable` + `CatalogoForm` with `entityType="clasificacion"`.
+confirmar_ficha:
+- Requires: estado != "confirmada", numero_participantes_actuales > 0, zero incomplete participants
+- Transition: any -> "confirmada"
+- Sets fecha_confirmacion = now()
+- Atomically sets all active Participante.confirmado = True
 
-#### Variables - Departamentos
-- Entity: `Departamento` — a department within a company (e.g., "Recursos Humanos", "Producción").
-- Type: CATALOG — used in participant registration or client profiles.
-- Backend: `/core/departamentos/`
-- Physical file: `sections/general/DepartamentosSection.jsx` (misrouted under Variables tab)
-- UI: Shared `CatalogosTable` + `CatalogoForm` with `entityType="departamento"`.
+revertir_confirmacion:
+- Requires: estado == "confirmada"
+- Transition: "confirmada" -> "en_proceso"
+- Sets fecha_confirmacion = None
+- Resets all Participante.confirmado = False
 
-#### Variables - Áreas Temáticas
-- Entity: `AreaTematica` — a thematic area grouping for courses (e.g., "Tecnología", "Habilidades Directivas").
-- Type: CATALOG — used as dropdown in `CatalogCourseForm` to categorize courses by subject matter.
-- Backend: `/core/areas-tematicas/`
-- Physical file: `sections/general/AreasTematicasSection.jsx` (misrouted under Variables tab)
-- UI: Shared `CatalogosTable` + `CatalogoForm` with `entityType="area_tematica"`.
+cancelar_ficha:
+- Requires: estado not in ["cancelada", "completada"]
+- Transition: any -> "cancelada"
+
+reactivar_ficha:
+- Requires: estado == "cancelada"
+- Restores soft-delete if deleted_date is set
+- Transition: "cancelada" -> "en_proceso" (if has participants) or "pendiente"
+
+confirmar_reagendamiento:
+- Requires: ficha.curso_asociado is set AND ficha.ficha_origen is set
+- Confirms attendance at rescheduled course
+
+**model save() behavior**:
+- When transitioning to "confirmada": bulk-confirms all active participants
+- On new ficha creation: calls _prellenar_datos_temporales() (copies empresa/contacto from cotizacion)
+- _calcular_fecha_limite() priority order: CursoAgendado.fechai -> cotizacion.fecha_vencimiento -> item.fecha_propuesta_inicio
 
 ---
 
-## Consolidated Classification Summary
+### 5. Factura / ItemFactura
 
-### CATALOG data (reference/lookup, rarely changes)
+**Location**: `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/contabilidad/models.py` line 10
 
-| Section | Entity | Tab Location | Backend Endpoint |
-|---|---|---|---|
-| Cursos Catálogo | CursoCatalogo | General | `/core/cursos-catalogo/` |
-| Clientes | Cliente | General | `/core/clientes/` |
-| Empresas | Empresa | General | `/core/empresas/` |
-| Plazas | Plaza | General | `/core/plazas/` |
-| Lugares | Lugar | General | `/core/lugares/` |
-| Instructores | Instructor | General | `/core/instructores/` |
-| Vendedores | Vendedor | General | `/core/vendedores/` |
-| Administradores | Administrador (User) | General | `/core/users/?role=admin` |
-| Tipos de Material | TipoMaterial | Logistica | `/logistica/tipos-material/` |
-| Ocupaciones Específicas | OcupacionEspecifica | Logistica | `/logistica/ocupaciones-especificas/` |
-| Clasificaciones | ClasificacionCurso | Variables (misplaced) | `/core/clasificaciones-curso/` |
-| Departamentos | Departamento | Variables (misplaced) | `/core/departamentos/` |
-| Áreas Temáticas | AreaTematica | Variables (misplaced) | `/core/areas-tematicas/` |
+**State Choices (ESTADO_CHOICES)**:
+```
+borrador   -> Draft invoice
+emitida    -> Issued, ready for SAT stamping
+timbrada   -> Stamped with PAC (UUID assigned, folio fiscal)
+cancelada  -> Cancelled (only from "timbrada")
+pagada     -> Fully paid
+```
 
-### OPERATIONAL data (created daily as business occurs)
+**State Transitions (enforced per-action in views, NO central TRANSICIONES_VALIDAS)**:
+- timbrar action: "emitida" -> "timbrada" (assigns UUID, fecha_timbrado)
+- cancelar action: "timbrada" -> "cancelada" (optionally creates NotaCredito)
+- marcar_pagada action: any non-pagada -> "pagada"
+- actualizar_saldo_pendiente() method: if saldo_pendiente <= 0 -> auto-sets "pagada"
 
-| Section | Entity | Tab Location | Frequency |
-|---|---|---|---|
-| Cursos Agendados | CursoAgendado | General | Per training session scheduled |
-| Cotizaciones Abiertas | CotizacionAbierta | Ventas | Per sales prospect |
-| Cotizaciones Cerradas | CotizacionCerrada | Ventas | Per confirmed quotation |
-| Fichas de Cot. Abiertas | FichaInscripcionAbierta | Logistica | Per open-course enrollment |
-| Fichas de Cot. Cerradas | FichaInscripcionCerrada | Logistica | Per closed-course enrollment |
-| Costos | Costo | Logistica | Per cost incurred per course |
-| Participantes | Participante | Logistica | Per attendee per course |
-| Diplomas y Constancias | Diploma | Logistica | Per completion per participant |
-| Formatos de Asistencia | FormatoAsistencia | Logistica | Per session |
-| Materiales Entregados | MaterialEntregado | Logistica | Per material delivery |
-| Facturas | Factura | Contabilidad | Per billing event |
-| Pagos | Pago | Contabilidad | Per payment received |
-| Notas de Credito | NotaCredito | Contabilidad | Per billing adjustment |
-| Comprobantes de Gasto | ComprobanteGasto | Contabilidad | Per expense recorded |
-| Importaciones | ImportJob | Variables | Per CSV/Excel bulk import |
+**Foreign Key Relationships**:
+- cliente -> core.Cliente (PROTECT: cannot delete client with invoices)
+- cotizacion_abierta -> ventas.CotizacionAbierta (SET_NULL, nullable)
+- cotizacion_cerrada -> ventas.CotizacionCerrada (SET_NULL, nullable)
+- items <- ItemFactura.factura (CASCADE)
+- pagos <- Pago.factura (PROTECT)
+- notas_credito <- NotaCredito.factura_origen (PROTECT)
 
-### SYSTEM CONFIG (key-value settings, changed by admins only)
+**DB Constraint** (model.clean()): Cannot have both cotizacion_abierta AND cotizacion_cerrada simultaneously.
 
-| Section | What It Configures | Tab Location |
-|---|---|---|
-| Variables - Ventas | Pricing factors (factor_1..9) + volume discount %s (14 keys) | Variables |
-| Variables - Logística | Logistics module parameters (currently empty, no seed) | Variables |
-| Variables - Contabilidad | Accounting module parameters (currently empty, no seed) | Variables |
-| Variables - Email | Microsoft Graph API credentials + email preferences | Variables |
+**ItemFactura**:
+- importe = (cantidad * precio_unitario) - descuento (calculated in save())
+- save() calls factura.calcular_totales() then factura.save() (cascade recalculation)
 
-### AMBIGUOUS / HYBRID
+**Factura.calcular_totales()**:
+- subtotal = sum of item importes
+- iva = (subtotal - descuento) * 0.16
+- total = subtotal - descuento + iva - retencion_iva - retencion_isr
 
-| Section | Entity | Notes |
-|---|---|---|
-| Recesos | Receso | Could be catalog break templates or per-course-instance entries. Own API file (`@/api/recesos`) rather than logistics. Placed in Logistica tab. |
+**Pago Model**:
+- estado: pendiente -> confirmado | rechazado | cancelado
+- Confirmed payments summed for saldo_pendiente on Factura
+- actualizar_saldo_pendiente() auto-marks Factura as "pagada" when fully settled
+
+**Orphaned Invoice Detection**:
+- notas_desvinculacion field populated when cotizacion is cascade-deleted
+- Filter: ?desvinculadas=true returns invoices with both cotizacion FKs null but notas_desvinculacion set
 
 ---
 
-## Structural Issues Identified
+## Complete State Machine Cascade Map
 
-### Issue 1: Routing Mismatch — Catalog Entities Under Variables Tab
+```
+CursoAgendado.cambiar_estado("CANCELADO")
+  -> _cancelar_relacionados()
+       -> CotizacionAbierta(s) linked to course: estado="rechazada" (if not already)
+            -> FichaDeInscripcion(s) on those cotizaciones: estado="cancelada" (_skip_signal=True)
+            -> cotizacion.recotizaciones children: estado="rechazada"
+                 -> their fichas: estado="cancelada" (_skip_signal=True)
+       -> CotizacionCerrada(s) linked via M2M: estado="rechazada" (if not already)
+            -> FichaDeInscripcion(s): estado="cancelada" (_skip_signal=True)
+            -> cotizacion.recotizaciones children: same cascade
+       -> fichas_directas (curso_asociado=this course): estado="cancelada" (_skip_signal=True)
 
-**Problem**: Three pure CATALOG entities (Clasificaciones, Departamentos, Áreas Temáticas) are:
-- Counted in `VariablesTab.jsx` nav tiles (`getCourseClassifications`, `getDepartments`, `getAreasThematic`)
-- Routed under `/management/variables/clasificaciones`, `/management/variables/departamentos`, `/management/variables/areas-tematicas`
-- But their section component files physically live in `src/pages/management/sections/general/`
+CursoAgendado.cambiar_estado("FINALIZADO")
+  -> _completar_fichas()
+       -> FichaDeInscripcion in ["confirmada","en_proceso"] via CotizacionAbierta -> "completada"
+       -> FichaDeInscripcion in ["confirmada","en_proceso"] via CotizacionCerrada -> "completada"
+       -> fichas_directas in ["confirmada","en_proceso"] -> "completada"
 
-**Impact**: Logical inconsistency. These are dropdown reference tables that users of the courses module need to find, but they are buried under a "Variables" tab that users associate with system configuration. An admin trying to add a new "Clasificacion" to use in a new Catalog Course must navigate to Variables instead of General.
+CursoAgendado state -> "VENCIDO" [post_save signal: vencer_cotizaciones_por_curso_vencido]
+  -> CotizacionAbierta(borrador|realizada|enviada) for this course:
+       estado="vencida", estado_previo_vencimiento saved
+  -> CotizacionCerrada(borrador|realizada|enviada) linked to this course:
+       estado="vencida", estado_previo_vencimiento saved
 
-**Recommended fix**: Move these three sections under the General tab navigation (counts + NavLinks in `GeneralTab.jsx`) and reroute from `/management/variables/*` to `/management/general/*`. The section component files are already in `sections/general/` so no file moves are needed — only router and tab nav changes.
+CotizacionAbierta created [post_save signal: actualizar_estado_curso_por_cotizacion_abierta]
+  -> If curso AGENDADO: cambiar_estado("PROSPECTADO")
 
-### Issue 2: Missing Seed Commands for Logistica and Contabilidad Variables
+CotizacionAbierta.estado="aceptada" [post_save signal]
+  -> If curso AGENDADO: PROSPECTADO then CONFIRMADO (two sequential cambiar_estado calls)
+  -> If curso PROSPECTADO: cambiar_estado("CONFIRMADO")
+  -> If fechai passed: cambiar_estado("EN_PROCESO")
 
-**Problem**: `initialize_sales_variables` command seeds 23 ventas config variables, but no equivalent command exists for `modulo='logistica'` or `modulo='contabilidad'`.
+CotizacionAbierta.estado="rechazada" [post_save signal]
+  -> Check for other active cotizaciones on same course
+  -> If none: cambiar_estado("AGENDADO")  [NOTE: downgrade, NOT CANCELADO]
 
-**Impact**: VariablesManager shows "No hay variables configuradas" empty state for those two modules. The "Inicializar" button in VariablesManager only appears for the Ventas module (`module === MODULES.VENTAS && variables.total < 10`), so Logistica/Contabilidad variables have no bootstrapping path.
+CotizacionAbierta deleted [post_delete signal]
+  -> If was last active cotizacion: PROSPECTADO -> AGENDADO
 
-### Issue 3: Recesos API Isolation
+CotizacionCerrada.estado="aceptada" [post_save signal]
+  -> For each linked CursoAgendado:
+       AGENDADO -> PROSPECTADO -> CONFIRMADO
+       CONFIRMADO + fechai passed -> EN_PROCESO
 
-**Problem**: `Recesos` uses its own API module (`@/api/recesos`) separate from `@/api/logistics`, unlike all other logistics sections.
+CotizacionCerrada created [post_save signal]
+  -> For each linked CursoAgendado AGENDADO: -> PROSPECTADO
 
-**Impact**: Minor inconsistency in API organization. Could be intentional if Recesos has a distinct backend app, but worth confirming.
+CotizacionCerrada.estado="rechazada" [post_save signal]
+  -> For each linked CursoAgendado: if no other active cerradas -> CANCELADO
+  [NOTE: CANCELADO, not AGENDADO - asymmetry with abierta rejection]
+
+CotizacionCerrada M2M post_add [m2m signal]
+  -> For each newly added CursoAgendado AGENDADO: -> PROSPECTADO
+
+CotizacionCerrada.cambiar_estado("aceptada") [API action - ventas/views.py]
+  -> Creates CursoAgendado per item x num_grupos
+       tipo_curso="cerrado", estado="CONFIRMADO"
+       If fechai passed: -> EN_PROCESO
+  -> cotizacion.cursos_agendados.add(*cursos_creados)
+
+CotizacionCerrada.cambiar_estado("aceptada"->"rechazada") [API action]
+  -> FichaDeInscripcion(s): estado="cancelada" + soft-delete
+
+CotizacionCerrada.duplicar(es_recotizacion=True) [API action]
+  -> Original: estado="recotizada"
+  -> Original fichas: estado="cancelada" + soft-delete
+  -> New CotizacionCerrada: estado="realizada", recotizada_de=original
+
+Participante created [post_save signal: verificar_confirmacion_curso_al_agregar_participante]
+  -> For each curso linked via ficha:
+       If PROSPECTADO + alcanzo_minimo_participantes: -> CONFIRMADO
+
+FichaDeInscripcion.estado="confirmada" [post_save signal, not _skip_signal]
+  -> For each linked curso:
+       If PROSPECTADO + min alcanzado: -> CONFIRMADO
+       If PROSPECTADO + fechai passed + min not reached: -> VENCIDO
+       If CONFIRMADO + fechai passed: -> EN_PROCESO
+
+FichaDeInscripcion.estado in ["en_proceso","cancelada"] [post_save signal]
+  -> For each linked curso CONFIRMADO + below min: -> PROSPECTADO
+
+CursoAgendado.fechai changed [post_save signal via FieldTracker]
+  -> FichaDeInscripcion(via CotizacionCerrada, not confirmada/completada): update fecha_limite_inscripcion
+  -> FichaDeInscripcion(fichas_directas, not confirmada/completada): update fecha_limite_inscripcion
+```
 
 ---
 
-## References
+## Multi-Seller / Multi-Cotizacion Scenarios
 
-### Key Files Analyzed
-- `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/pages/management/ManagementLayout.jsx`: Top-level shell with 6-tab navigation
-- `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/pages/management/tabs/GeneralTab.jsx`: 9 sub-sections, counts fetched in parallel
-- `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/pages/management/tabs/VentasTab.jsx`: 2 sub-sections
-- `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/pages/management/tabs/LogisticaTab.jsx`: 10 sub-sections
-- `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/pages/management/tabs/ContabilidadTab.jsx`: 4 sub-sections
-- `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/pages/management/tabs/VariablesTab.jsx`: 8 sub-sections (incl. 3 catalog misplacements)
-- `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/components/ui/VariablesManager.jsx`: Shared key-value config editor for Ventas/Logistica/Contabilidad variables
-- `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/api/configuration.jsx`: Full API for ConfiguracionSistema CRUD, por-modulo, batch update, initialize
-- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/core/models.py`: ConfiguracionSistema model (fields: modulo, seccion, clave, nombre, valor, tipo, unidad)
-- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/core/views/configuracion.py`: ViewSet with por-modulo, actualizar-multiple, inicializar-variables-ventas endpoints
-- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/core/management/commands/initialize_sales_variables.py`: Seeds 23 ventas config variables in 2 sections
+### Open Courses (CotizacionAbierta)
+A single CursoAgendado of tipo_curso="abierto" can have MULTIPLE CotizacionAbierta records
+pointing to it — one per interested client/seller combination.
 
----
+- numero_interesados property: counts cotizaciones in [realizada, enviada, aceptada, rechazada],
+  excludes "recotizada" to prevent duplicates
+- AGENDADO downgrade: only triggered if ALL other cotizaciones are rechazada/vencida
+- CONFIRMADO upgrade: triggered the moment ANY ONE cotizacion is accepted
+- No exclusive ownership: multiple sellers can quote the same open course
 
-**Next Steps**:
-1. Decide whether to move Clasificaciones, Departamentos, and Áreas Temáticas from Variables tab to General tab (router + nav change only).
-2. Create seed commands/data for logistica and contabilidad variables if those modules need configurable parameters.
-3. Clarify whether Recesos are per-course-instance records or reusable templates, and consider merging `@/api/recesos` into `@/api/logistics`.
+### Closed Courses (CotizacionCerrada)
+The M2M pre_add signal enforces that a CursoAgendado belongs to at most ONE active CotizacionCerrada.
+This prevents two sellers from simultaneously quoting the same closed course session.
 
----
----
-
-# Codebase Analysis Report — New User Roles Impact
-**Generated**: 2026-03-04
-**Analyst**: codebase-analyzer
-**Request**: Understand the full impact of adding two new user roles ("capturista" and "administrativo") to the Django+React system. Currently three roles exist: admin, seller, customer. Analyze backend role definitions, frontend routing, plaza assignment, contabilidad section, and custom permission classes. Provide file paths and line numbers for all findings.
+Critical asymmetry:
+- CotizacionAbierta rejection -> course goes to AGENDADO (soft downgrade, recoverable)
+- CotizacionCerrada rejection -> course goes to CANCELADO (hard termination)
+  Rationale: closed courses are purpose-created for a specific client; rejection = no longer needed.
+  Risk: if the course pre-existed and the cotizacion is the first and only one, the course is
+  permanently terminated on first rejection.
 
 ---
 
-## Executive Summary
+## Transfer / Reagendamiento Logic
 
-Adding "capturista" and "administrativo" to this system is a significant cross-cutting change that touches the database layer, all four backend apps, all major frontend modules, the TypeScript type system, and at least six permission classes. The analysis identified one blocking database constraint, four data-security regressions that would occur without explicit handling, a frontend login loop for any unknown role, and two duplicate permission class definitions that must both be updated.
+### Simple Reschedule (CursoAgendadoService.reagendar_simple)
+- Updates fechai, fechaf, horai, horaf in-place on the SAME CursoAgendado
+- Validates instructor conflicts via InstructorAvailabilityService
+- Does NOT create a new CursoAgendado record
+- Triggers post_save signal -> actualizar_fecha_limite_fichas_al_reagendar
+  -> Updates fecha_limite_inscripcion on all non-confirmed/non-completed fichas
+- Increments veces_reagendado counter
+- Appends to historial_reagendamientos JSON
 
-The most critical finding is a hard database constraint: `role = models.CharField(max_length=10, ...)` in `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/users/models.py` line 83. The value "administrativo" is 14 characters and will be silently truncated or rejected by PostgreSQL without a migration to widen the column. "capturista" is exactly 10 characters and would fit today, but widening the column for both roles in a single migration is strongly recommended.
-
-The second critical finding is in the ventas and organizacion ViewSets: `get_queryset()` uses `if role == "customer" ... elif role == "seller" ... else` (implicit admin) patterns. Any role not explicitly matched falls into the admin branch and receives unfiltered, all-record access. Both "capturista" and "administrativo" users would silently see every quotation and every empresa in the system without additional guards.
-
-On the frontend, both `RootRedirect` and `LoginRedirect` in the router fall to `default: return <Navigate to="/login">`, which sends any unrecognized role back to the login page in an infinite loop. Every `RoleRoute` gate that currently lists `["admin", "seller"]` would deny access to the new roles, and the Navbar `getNavigationLinks()` function returns an empty array for unknown roles — leaving users with no navigation links even if they somehow reach a protected page.
-
----
-
-## Analysis Area 1: Backend Role Definitions and Role Checks
-
-### 1.1 The Role Field — Database Constraint
-
-**File**: `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/users/models.py`
-
-**Lines 74–83**:
-```python
-ROLE_CHOICES = [
-    ("admin", "Administrador"),
-    ("seller", "Vendedor"),
-    ("customer", "Cliente"),
-]
-role = models.CharField(max_length=10, choices=ROLE_CHOICES, default="customer")
-```
-
-**Impact**:
-- "capturista" = 10 characters — fits within `max_length=10` today.
-- "administrativo" = 14 characters — **exceeds `max_length=10` and will fail at the database level**. PostgreSQL raises `value too long for type character varying(10)`. Django's `choices` validation only fires at the form/serializer layer; the model `save()` will pass the value to the database unvalidated if called directly.
-- Both new roles are absent from `ROLE_CHOICES`. Django will not raise a validation error for missing choices at the ORM level, but `UserCreateSerializer` (line 70) uses `serializers.ChoiceField(choices=User.ROLE_CHOICES)` which will reject any value not in that list with a 400 error.
-
-**Required changes**:
-1. Add both new roles to `ROLE_CHOICES`.
-2. Increase `max_length` to at least 14 (to accommodate "administrativo").
-3. Generate and apply a migration (`makemigrations users`, `migrate`).
-
-**Line 51–52** — `create_user()` sets `is_staff` and `is_superuser` only for `role == "admin"`. New roles correctly receive `is_staff=False, is_superuser=False` with no code changes needed here.
-
-**Line 126–132** — `set_as_customer()` hardcodes `role = "customer"`. This method is only called when converting an existing user to a passwordless customer; it does not affect the new roles.
-
-### 1.2 UserCreateSerializer — Validation Branching
-
-**File**: `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/users/serializers.py`
-
-**Line 70**:
-```python
-role = serializers.ChoiceField(choices=User.ROLE_CHOICES)
-```
-This is the first gate. Until `ROLE_CHOICES` includes the new roles, any API attempt to create a "capturista" or "administrativo" user returns `{"role": ["\"capturista\" is not a valid choice."]}`.
-
-**Lines 101–143** — `validate()` contains four explicit branches:
-- Lines 101–112: `if role in ("admin", "seller")` — requires username, name, last_name, and password (on create).
-- Lines 115–122: `if role == "admin"` — forbids vendedor_data and cliente_data.
-- Lines 126–133: `elif role == "seller"` — forbids cliente_data, requires vendedor_data on create.
-- Lines 136–142: `elif role == "customer"` — forbids vendedor_data, requires cliente_data.
-
-**Gap**: Neither "capturista" nor "administrativo" matches any of those branches. A user created with either new role would:
-- Not be required to provide username/name/last_name/password (they fall outside the `if role in ("admin", "seller")` block).
-- Not be prevented from sending arbitrary nested data.
-- Not be required to send any nested profile data.
-- Successfully pass validation with just `email` and `role`.
-
-**Lines 166–228** — `create()` only creates business profiles for `role == "seller"` (Vendedor) and `role == "customer"` (Cliente). New roles would get a bare User record with no profile — which is likely correct for "capturista" and may be correct for "administrativo", but the password/username requirement bypass is a problem.
-
-**Recommended change**: Add a third branch to the `if role in (...)` check:
-```python
-if role in ("admin", "seller", "capturista", "administrativo"):
-    # require username, name, last_name, password on create
-```
-And add explicit validation that those roles reject nested profile data:
-```python
-if role in ("capturista", "administrativo"):
-    if data.get("vendedor_data") is not None:
-        errors["vendedor_data"] = "No se aceptan datos de vendedor para este rol."
-    if data.get("cliente_data") is not None:
-        errors["cliente_data"] = "No se aceptan datos de cliente para este rol."
-```
-
-### 1.3 UserViewSet — Role-Specific Actions
-
-**File**: `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/users/views.py`
-
-**Line 15–25** — `IsAdmin` permission class:
-```python
-class IsAdmin(permissions.BasePermission):
-    def has_permission(self, request, view):
-        return bool(
-            request.user and request.user.is_authenticated
-            and request.user.role == "admin"
-        )
-```
-The entire `UserViewSet` is protected by `IsAdmin` (line 34). Only role=="admin" can create/list/update users. New roles have no special access here — this is correct behavior.
-
-**Lines 297, 306** — `reactivate()` action:
-```python
-if user.role == "seller" and hasattr(user, "vendedor"):
-    # reactivate Vendedor profile
-if user.role == "customer" and hasattr(user, "cliente"):
-    # reactivate Cliente profile
-```
-New roles fall through both branches silently. Their User record is reactivated but no associated profile is touched — which is correct since they have no profile model.
-
-**Lines 453, 553, 600** — `create_client` and `update_client` actions check `if user.role == "seller"` for plaza restriction enforcement. An "administrativo" user calling these endpoints would bypass the plaza filter and be treated like an admin (no plaza restriction). Whether that is desired depends on the intended access level of "administrativo".
-
-**Lines 681–683, 700–701** — `set_pin` and `set_pin_for_user`:
-```python
-admins_con_pin = User.objects.filter(role="admin", is_active=True, pin_hash__isnull=False)
-# and
-if target_user.role != "admin":
-    return Response({"error": "Solo se puede configurar PIN para administradores."}, ...)
-```
-PIN system is explicitly restricted to `role="admin"`. New roles cannot set or receive PINs. Correct.
-
-### 1.4 Authentication Views — Login Flow and PIN Gate
-
-**File**: `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/authentication/views.py`
-
-**Lines 437–450** — `CheckUserTypeView`:
-```python
-user_type = "standard"  # admin o seller
-if user.role == "customer":
-    user_type = "customer"
-```
-Any role that is not "customer" is classified as "standard". Both new roles would correctly receive `user_type = "standard"` — meaning they use password login, not PIN. No change needed here.
-
-**Lines 479–483** — `EmailPINRequestView`:
-```python
-if user.role != "customer":
-    return Response({"error": "Este método de acceso es solo para clientes"}, ...)
-```
-Non-customers (including new roles) are correctly blocked from PIN login. No change needed.
-
-### 1.5 Core Permission Classes
-
-**File**: `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/core/views/base.py`
-
-Six permission-related classes are defined or enforced here:
-
-| Class | Line | Logic | Impact on New Roles |
-|---|---|---|---|
-| `IsAdminOrSeller` | 14–20 | `role in ('admin', 'seller')` | New roles are denied all endpoints using this class |
-| `IsAuthenticatedReadOnly` | 23–35 | Read: any auth; Write: `role in ('admin', 'seller')` | New roles can read but cannot create/update/delete |
-| `IsAdminOrSellerWithPlazaFilter` | 38–74 | `role in ('admin', 'seller')` for access | New roles are denied entirely |
-| `SoftDeleteModelViewSet.get_queryset` | 95 | `role != 'admin'` denies inactive records | New roles cannot see soft-deleted records (correct) |
-| `SoftDeleteModelViewSet.reactivate` | 211 | `role != 'admin'` denies reactivation | New roles cannot reactivate records (correct) |
-| `SoftDeleteModelViewSet.permanent_delete` | 253 | `role != 'admin'` denies permanent delete | New roles cannot permanently delete (correct) |
-
-**Critical**: Every ViewSet that uses `IsAdminOrSeller` or `IsAdminOrSellerWithPlazaFilter` as its `permission_classes` will return HTTP 403 for any "capturista" or "administrativo" user. This affects the entire `core`, `contabilidad`, and `ventas` apps.
-
-### 1.6 Logistica Duplicate Permission Classes
-
-**File**: `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/logistica/views/base.py`
-
-**Lines 8–24** — Defines its own copies of `IsAdminOrSeller` and `IsAdminSellerOrCustomer`:
-```python
-class IsAdminOrSeller(permissions.BasePermission):
-    def has_permission(self, request, view):
-        return bool(user and user.is_authenticated and getattr(user, 'role', None) in ('admin', 'seller'))
-
-class IsAdminSellerOrCustomer(permissions.BasePermission):
-    def has_permission(self, request, view):
-        return bool(user and user.is_authenticated and getattr(user, 'role', None) in ('admin', 'seller', 'customer'))
-```
-
-These are byte-for-byte duplicates of the core versions. When adding new roles, **both files must be updated**. If only `core/views/base.py` is updated, logistica endpoints will still block the new roles.
-
-### 1.7 Ventas ViewSets — Data Exposure Risk
-
-**File**: `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/ventas/views.py`
-
-**Lines 159–188** — `CotizacionCerradaViewSet.get_queryset()`:
-```python
-if self.request.user.role == "customer":
-    queryset = queryset.filter(cliente__user=self.request.user)
-elif self.request.user.role == "seller":
-    # filter by plaza
-    ...
-# No else branch — implicit fallthrough gives all records to any other role
-```
-
-**Lines 1435–1468** — `CotizacionAbiertaViewSet.get_queryset()`:
-```python
-if self.request.user.role == "customer":
-    queryset = queryset.filter(cliente__user=self.request.user)
-elif self.request.user.role == "seller":
-    # filter by plaza
-    ...
-# Same fallthrough
-```
-
-**Data exposure**: Any role not explicitly matched receives the full unfiltered queryset — identical to admin access. Both "capturista" and "administrativo" would see all quotations from all plazas until explicit branches are added.
-
-The `permission_classes` on both ViewSets use `IsAdminOrSeller` (from core), which currently blocks the new roles at the access control layer. So the data exposure is **latent** — it only becomes active once permission classes are updated to allow the new roles. However, it must be addressed at that time.
-
-### 1.8 Core Organizacion Views — Same Pattern
-
-**File**: `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/core/views/organizacion.py`
-
-**Lines ~347–360** — `EmpresaViewSet.get_queryset()`:
-```python
-if user.role == "admin":
-    return queryset  # all empresas
-if user.role == "seller":
-    # filter by vendedor plazas
-    ...
-# New roles fall through to the bottom of the method — behavior depends on what follows
-```
-
-Same fallthrough risk as ventas. Must add explicit handling for new roles before enabling their access.
+### Complex Transfer (CursoAgendado.transfer_relationships)
+- Creates a NEW CursoAgendado as the rescheduled version
+- For "abierto": bulk-updates CotizacionAbierta.curso FK to point to new course
+  -> Reactivates "vencida" cotizaciones (restores estado_previo_vencimiento)
+- For "cerrado": M2M adds existing cotizaciones to new course
+  -> Reactivates "vencida" cotizaciones
+- Fichas are NOT moved; they remain with their cotizaciones (which now reference new course)
+- fichas_directas use curso_asociado FK + ficha_origen FK chain for tracking rescheduled fichas
+- Returns summary dict: {cotizaciones_transferidas, costos_copiados, fichas_mantenidas}
 
 ---
 
-## Analysis Area 2: Frontend Role-Based Routing and Access
+## Cancellation Scenarios
 
-### 2.1 RootRedirect and LoginRedirect — Login Loop
+### Scenario 1: Course Cancelled Before Any Quotation (AGENDADO -> CANCELADO)
+- _cancelar_relacionados() finds nothing to cascade
+- State: terminal, no downstream effects
 
-**File**: `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/router/index.jsx`
+### Scenario 2: Open Course Cancelled With Active Quotations
+- All CotizacionAbierta -> "rechazada" (unless already rechazada)
+- All FichaDeInscripcion on those cotizaciones -> "cancelada" (_skip_signal=True, NOT soft-deleted)
+- Recotizacion chains followed and cancelled
+- Factura records: SET_NULL on cotizacion_abierta FK, not deleted
 
-**Lines 89–98** — `RootRedirect`:
-```jsx
-switch (user.role) {
-  case "customer": return <Navigate to="/home" replace />;
-  case "admin":    return <Navigate to="/management" replace />;
-  case "seller":   return <Navigate to="/sales" replace />;
-  default:         return <Navigate to="/login" replace />;
-}
-```
+### Scenario 3: Closed Course Cancelled With Accepted Cotizacion + Fichas
+- CotizacionCerrada -> "rechazada"
+- FichaDeInscripcion -> "cancelada" (_skip_signal=True, NOT soft-deleted here)
+- Factura: SET_NULL on cotizacion_cerrada FK
 
-**Lines 110–119** — `LoginRedirect` (same switch):
-```jsx
-switch (user.role) {
-  case "customer": return <Navigate to="/home" replace />;
-  case "admin":    return <Navigate to="/management" replace />;
-  case "seller":   return <Navigate to="/sales" replace />;
-  default:         return <Navigate to="/login" replace />;
-}
-```
+### Scenario 4: Quotation Rejected (Abierta) — Course Has Other Active Quotations
+- Signal: otras_cotizaciones = CotizacionAbierta.filter(curso=curso).exclude(id=instance.id).exclude(estado__in=["rechazada","vencida"]).exists()
+- If True: NO course state change; course stays PROSPECTADO or CONFIRMADO
+- The rejected cotizacion's fichas are NOT automatically cancelled in this scenario
 
-**Impact**: A "capturista" or "administrativo" user who successfully authenticates will be redirected to `/login`, which will then re-run `LoginRedirect`, which will redirect to `/login` again — infinite loop. The user can never reach any page.
-
-**Required change**: Add cases for both new roles pointing to their respective landing pages (e.g., `/sales` or a new dedicated route).
-
-### 2.2 RoleRoute — Access Gate
-
-**File**: `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/router/RoleRoute.jsx`
-
-The component checks `allowed.includes(user.role)` and redirects to `/` if not included. Since all current `RoleRoute` gates specify only `["admin"]`, `["admin", "seller"]`, or `"customer"`, every protected route will redirect new roles to `/`, which triggers `RootRedirect`, which redirects to `/login` again.
-
-**Route gates requiring updates** (from `index.jsx`):
-
-| Route Path | Current Roles Allowed | Impact on New Roles |
-|---|---|---|
-| `/management` | `["admin"]` (line 174) | "administrativo" needs access if admin-like |
-| `/sales` | `["admin", "seller"]` (line 325) | "capturista" or "administrativo" may need access |
-| `/logistics` | `["admin", "seller"]` (line 406) | Same |
-| `/accounting` | `["admin", "seller"]` (line 427) | Same |
-| `/home` | `"customer"` (line 321) | New roles do not need this |
-
-### 2.3 Navbar — Empty Navigation for Unknown Roles
-
-**File**: `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/components/layout/Navbar.jsx`
-
-**Lines 67–94** — `getNavigationLinks()`:
-```jsx
-if (user.role === 'customer') { return [{to: "/home", label: "Inicio"}]; }
-if (user.role === 'seller')   { return [Ventas, Logística, Contabilidad]; }
-if (user.role === 'admin')    { return [Ventas, Logística, Contabilidad, Administración]; }
-return [];  // line 94 — fallback for unknown roles
-```
-
-A user with a new role who somehow bypasses the router gate would see a completely empty navigation bar. No links, no way to navigate.
-
-**Required change**: Add `if/else if` blocks for both new roles with the appropriate set of navigation links.
-
-### 2.4 Inline Role Checks in Components
-
-The `Sales.jsx` component alone contains over 30 inline `user?.role === "admin"` and `user?.role === "seller"` checks. These controls show or hide UI elements (buttons, form fields, view-all toggles). New roles that land on `/sales` would see a stripped-down view — no buttons that require seller or admin role, no form controls, read-only where controlled by `user?.role === "seller"`.
-
-**File**: `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/pages/modules/Sales.jsx`
-
-Notable checks:
-- Line 2617: `user?.role === "admin"` — shows "Crear Curso Agendado" button.
-- Lines 3287–3352: `user?.role === "seller"` — controls form read-only mode and delete button visibility.
-
-Each of these would need to be updated to include new roles in the condition if those roles should have the same UI access as seller or admin.
-
-### 2.5 TypeScript Type Definition
-
-**File**: `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/types/user.d.ts`
-
-**Line 5**:
-```typescript
-role: "admin" | "seller" | "customer";
-```
-
-TypeScript will produce a type error anywhere `user.role` is compared against a new role string until this union is updated. While TypeScript errors do not prevent the app from running (Vite does not fail on type errors by default), they produce noise in the IDE and may block CI if a type-check step exists.
-
-**Required change**: Extend the union to include new roles:
-```typescript
-role: "admin" | "seller" | "customer" | "capturista" | "administrativo";
-```
-
-### 2.6 AdminForm and SellerForm — Hardcoded Role Values
-
-**File**: `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/components/forms/AdminForm.jsx`
-
-Lines 47, 74, 222: `role: "admin"` is hardcoded in form state and payload. This form can only create admin users. A new form would need to be created to create "capturista" or "administrativo" users via the management UI.
-
-**File**: `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/components/forms/SellerForm.jsx`
-
-Lines 270, 293: `role: "seller"` is hardcoded. Same situation.
-
-Neither form needs modification for the new roles, but corresponding new forms (`CapturistaForm.jsx`, `AdministrativoForm.jsx`) would need to be created and registered in the management sections if admins should be able to create users with those roles from the UI.
+### Scenario 5: Course Vencido
+- Trigger: FieldTracker detects fechai/fechaf change (pre_save) OR verificar_vencimiento() on list/retrieve
+- AGENDADO/PROSPECTADO -> VENCIDO
+- post_save signal: all borrador/realizada/enviada cotizaciones -> "vencida" (saves estado_previo_vencimiento)
+- Reactivation: VENCIDO -> CONFIRMADO, AGENDADO, or CANCELADO (manual)
 
 ---
 
-## Analysis Area 3: Plaza Assignment System
-
-### 3.1 Data Model
-
-**File**: `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/core/models.py`
-
-The plaza assignment is a simple one-to-many relationship:
-- `Plaza` has a `ForeignKey` to `Vendedor` (nullable, blank=True) — one seller per plaza at any time.
-- `Vendedor` has a `OneToOneField` to `User` with `related_name="vendedor"`.
-- A seller can hold multiple plazas via the reverse relation: `user.vendedor.plaza_set.all()`.
-
-The relationship direction means:
-1. Each `Plaza` can be assigned to at most one `Vendedor`.
-2. One `Vendedor` can have many `Plaza`s.
-3. "Unassigned" plazas have `vendedor=None`.
-
-### 3.2 How Plazas Filter Data
-
-All plaza-based filtering works through the chain:
-```
-user → user.vendedor → vendedor.plaza_set.values_list('id', flat=True) → filter(plaza_id__in=plazas_ids)
-```
-
-This means:
-- Only users with `role="seller"` have a `Vendedor` profile and thus a `plaza_set`.
-- Accessing `user.vendedor` on a non-seller user raises `RelatedObjectDoesNotExist`.
-- The ventas and core views always check `role == "seller"` before accessing `user.vendedor`.
-
-### 3.3 Impact on New Roles
-
-Neither "capturista" nor "administrativo" has a `Vendedor` profile in the current design. There are two options:
-
-**Option A — No plaza association**: New roles have access similar to admin (all data) or are restricted in some other dimension. No plaza filtering code needs to change.
-
-**Option B — Plaza-associated**: If "capturista" should be restricted to specific plazas (e.g., a data entry operator for one region), the plaza filtering chain would need to be refactored. Options include:
-- Reusing the `Vendedor` model for capturistas (anti-pattern — semantically wrong).
-- Adding a `ManyToManyField` from User to Plaza directly (clean but requires migration and new filtering code).
-- Creating a separate profile model for capturistas with a plaza relationship.
-
-This is an architectural decision to make before implementation.
-
----
-
-## Analysis Area 4: Contabilidad Section
-
-### 4.1 Backend
-
-The contabilidad module is fully implemented.
-
-**Models** (`/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/contabilidad/models.py`):
-- `Factura` — invoice linked to a cotizacion
-- `ItemFactura` — line items on a factura
-- `NotaCredito` — credit note against a factura
-- `Pago` — payment record
-- `ComprobanteGasto` — expense voucher/receipt
-
-All extend `BaseModel` (soft delete, created_at, updated_at).
-
-**Views** (`/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/contabilidad/views.py`):
-All viewsets use `permission_classes = [IsAuthenticated]` only — no role restriction at the permission class level. The only role check in the entire file is at approximately line 596: `if user.role == "seller"` to filter `cursos` by the seller's plazas. Any authenticated user (including new roles) can access contabilidad endpoints today.
-
-**URLs** (`/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/contabilidad/urls.py`):
-Registers: `facturas/`, `items-factura/`, `pagos/`, `notas-credito/`, `comprobantes-gasto/`, `estadisticas/`, `cursos/` — all under `api/contabilidad/`.
-
-### 4.2 Frontend
-
-The accounting module is fully implemented on the frontend.
-
-**Route** (`/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/router/index.jsx`, line 427):
-```jsx
-<Route element={<RoleRoute roles={["admin", "seller"]} />}>
-  {/* accounting routes */}
-</Route>
-```
-Currently blocked to admin and seller only. New roles require explicit addition to this `roles` array to gain access.
-
-**Navbar**: The accounting link ("Contabilidad") appears in the navigation for both seller and admin roles. New roles would need to be added to the `getNavigationLinks()` function to receive this link.
-
----
-
-## Analysis Area 5: Custom Permission Classes — Full Inventory
-
-There are **six** distinct permission classes across the backend. Four are in core, two are duplicates in logistica.
-
-### Core App (`/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/core/views/base.py`)
-
-| Class | Line | Allowlist | Notes |
-|---|---|---|---|
-| `IsAdminOrSeller` | 14 | `('admin', 'seller')` | Used by core, ventas, contabilidad ViewSets |
-| `IsAuthenticatedReadOnly` | 23 | Read: any auth; Write: `('admin', 'seller')` | Write-gates for read-heavy resources |
-| `IsAdminOrSellerWithPlazaFilter` | 38 | `('admin', 'seller')` | Has `has_object_permission` that additionally filters by plaza for sellers |
-
-### Users App (`/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/users/views.py`)
-
-| Class | Line | Allowlist | Notes |
-|---|---|---|---|
-| `IsAdmin` | 15 | `role == "admin"` only | Protects `UserViewSet`, `set-pin`, `has-pin` |
-
-### Logistica App (`/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/logistica/views/base.py`)
-
-| Class | Line | Allowlist | Notes |
-|---|---|---|---|
-| `IsAdminOrSeller` (duplicate) | 8 | `('admin', 'seller')` | Exact copy of core version; used by logistica ViewSets |
-| `IsAdminSellerOrCustomer` | 17 | `('admin', 'seller', 'customer')` | Used for logistica routes that customers can read |
-
-### Inline Role Checks in SoftDeleteModelViewSet (not a permission class, but acts as one)
-
-| Method | File | Line | Check | Effect |
-|---|---|---|---|---|
-| `get_queryset` | `core/views/base.py` | 95 | `role != 'admin'` | Non-admins cannot see inactive records |
-| `reactivate` | `core/views/base.py` | 211 | `role != 'admin'` | Non-admins cannot reactivate |
-| `permanent_delete` | `core/views/base.py` | 253 | `role != 'admin'` | Non-admins cannot permanently delete |
-
----
-
-## Implementation Plan
-
-### Phase 1 — Backend Foundation (required before any frontend work)
-
-#### 1. Database Migration
-**File**: `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/users/models.py`
-
-Changes needed:
-- Add `("capturista", "Capturista")` and `("administrativo", "Administrativo")` to `ROLE_CHOICES` (lines 74–78).
-- Change `max_length=10` to `max_length=20` on the `role` field (line 83).
-
-After model change:
-```bash
-docker-compose exec backend python manage.py makemigrations users
-docker-compose exec backend python manage.py migrate
-```
-
-#### 2. Serializer Validation Update
-**File**: `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/users/serializers.py`
-
-Changes needed at `validate()` (lines 101–143):
-- Extend the base fields check: `if role in ("admin", "seller", "capturista", "administrativo"):` (line 101).
-- Add a branch after the "customer" elif to handle new roles: reject vendedor_data and cliente_data, require no profile data.
-
-#### 3. Permission Classes Update
-Update all six permission classes:
-
-**`/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/core/views/base.py`** (lines 20, 35, 44):
-Decide the new role levels and update the tuples. For example, if "administrativo" should have admin-level access and "capturista" should have seller-level access:
-- `IsAdminOrSeller`: add whichever new roles should have write access.
-- `IsAuthenticatedReadOnly`: update the write-allowlist accordingly.
-- `IsAdminOrSellerWithPlazaFilter`: update allowlist; if new roles need plaza filtering, add additional branches in `has_object_permission`.
-
-**`/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/logistica/views/base.py`** (lines 14, 23):
-Mirror the same changes made to the core permission classes. These must be kept in sync.
-
-Consider refactoring to import from core instead of duplicating:
-```python
-from src.apps.core.views.base import IsAdminOrSeller  # instead of redefining
-```
-
-#### 4. Ventas ViewSet get_queryset() Guards
-**File**: `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/ventas/views.py`
-
-Add explicit branches for new roles in `CotizacionCerradaViewSet.get_queryset()` (lines 159–188) and `CotizacionAbiertaViewSet.get_queryset()` (lines 1435–1468):
-```python
-elif self.request.user.role == "capturista":
-    # define what a capturista can see — e.g., same as seller but no plaza filter,
-    # or all records, or empty queryset
-elif self.request.user.role == "administrativo":
-    # define what an administrativo can see — likely all records like admin
-```
-
-#### 5. Core Organizacion ViewSet Guards
-**File**: `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/core/views/organizacion.py`
-
-Add explicit handling in `EmpresaViewSet.get_queryset()` for the new roles to prevent fallthrough admin access.
-
-### Phase 2 — Frontend Foundation
-
-#### 1. TypeScript Type Definition
-**File**: `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/types/user.d.ts` (line 5)
-
-Change:
-```typescript
-role: "admin" | "seller" | "customer";
-```
-To:
-```typescript
-role: "admin" | "seller" | "customer" | "capturista" | "administrativo";
-```
-
-#### 2. Fix Login Loop — Router Redirect Functions
-**File**: `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/router/index.jsx` (lines 89–98, 110–119)
-
-Add cases for new roles in both `RootRedirect` and `LoginRedirect` switch statements:
-```jsx
-case "capturista":    return <Navigate to="/sales" replace />;
-case "administrativo": return <Navigate to="/management" replace />;
-```
-(Adjust destination routes based on intended access levels.)
-
-#### 3. RoleRoute Gates
-**File**: `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/router/index.jsx` (lines 174, 325, 406, 427)
-
-Update `roles` arrays for each `RoleRoute` based on access decisions:
-- `/management`: add "administrativo" if it should have management access.
-- `/sales`: add "capturista" and/or "administrativo" as needed.
-- `/logistics`: same.
-- `/accounting`: same.
-
-#### 4. Navbar Navigation Links
-**File**: `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/components/layout/Navbar.jsx` (lines 67–94)
-
-Add `if/else if` blocks for new roles before the `return []` fallback:
-```jsx
-if (user.role === 'capturista') {
-  return [{ to: "/sales", label: "Ventas" }];
-}
-if (user.role === 'administrativo') {
-  return [
-    { to: "/sales", label: "Ventas" },
-    { to: "/logistics", label: "Logística" },
-    { to: "/accounting", label: "Contabilidad" },
-    { to: "/management", label: "Administración" }
-  ];
-}
-```
-
-### Phase 3 — Management UI (to create users with new roles)
-
-If admins should be able to create "capturista" and "administrativo" users from the management UI:
-
-1. Create `CapturistaForm.jsx` and `AdministrativoForm.jsx` in `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/components/forms/`. Model them on `AdminForm.jsx` but hardcode the appropriate role value.
-2. Create corresponding management sections in `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/pages/management/sections/general/` (e.g., `CapturistasSection.jsx`, `AdministrativosSection.jsx`).
-3. Add the new sections as sub-routes under `/management/general` in `index.jsx`.
-4. Add navigation tiles for the new sections in `GeneralTab.jsx`.
-
----
-
-## Risk Summary
-
-| Risk | Severity | Area | Description |
-|---|---|---|---|
-| "administrativo" exceeds max_length=10 | BLOCKING | DB / Backend | Will fail at database layer without migration |
-| Unfiltered queryset fallthrough in ventas | HIGH | Backend | New roles see all quotations until explicit branch added |
-| Unfiltered queryset fallthrough in organizacion | HIGH | Backend | New roles see all empresas until explicit branch added |
-| Login loop for unknown roles | HIGH | Frontend | User cannot reach any page after login |
-| Duplicate permission classes not updated | HIGH | Backend | Logistica endpoints remain blocked even after core is updated |
-| TypeScript union not updated | MEDIUM | Frontend | Type errors in IDE; may block CI type-check |
-| Navbar empty for unknown roles | MEDIUM | Frontend | No navigation links displayed |
-| Sales.jsx inline role checks | MEDIUM | Frontend | UI elements hidden or shown incorrectly |
-| Serializer validation bypass for new roles | LOW | Backend | New roles can be created with minimal data (no username required) |
-| AdminForm/SellerForm hardcoded roles | LOW | Frontend | No UI path to create new-role users without new forms |
+## Critical Issues and Anti-Patterns
+
+### Issue 1: Duplicate CursoAgendado Creation Paths
+Two separate code paths in ventas/views.py create CursoAgendado for closed quotations:
+1. CotizacionCerradaViewSet.cambiar_estado (lines 751-812): the primary correct path
+2. CotizacionCerradaViewSet.send_inscription_form (lines 1284-1398): legacy path that also
+   creates courses, transitions cotizacion to "aceptada", AND creates FichaDeInscripcion
+
+These paths are not synchronized. If the primary path is updated, send_inscription_form is a
+maintenance hazard.
+
+### Issue 2: Asymmetric Rejection Behavior (Abierta vs Cerrada)
+- Abierta rejection -> AGENDADO (recoverable)
+- Cerrada rejection -> CANCELADO (terminal)
+This is intentional per business logic but undocumented. If a closed course needs to be
+re-offered after rejection, there is no recovery path — a new CursoAgendado must be created.
+
+### Issue 3: FichaDeInscripcion.save() Calls full_clean()
+Every save() on FichaDeInscripcion calls self.full_clean(), including cascade saves from
+_cancelar_relacionados() and _completar_fichas(). The _skip_signal flag bypasses signal
+re-triggering but NOT validation. If data is inconsistent, ValidationError could interrupt
+the cancellation cascade.
+
+### Issue 4: _skip_signal Pattern
+The _skip_signal = True attribute set on instances before save is a non-standard pattern.
+If a new signal handler is added to logistica/signals.py without checking _skip_signal,
+cascade loops become possible. Current handlers do check: getattr(instance, "_skip_signal", False).
+
+### Issue 5: Factura Has No TRANSICIONES_VALIDAS Map
+Unlike cotizaciones, the Factura state machine has no central transition guard. Arbitrary
+PATCH requests can set estado to any value. Only the specific action endpoints (timbrar,
+cancelar, marcar_pagada) enforce transitions.
+
+### Issue 6: cambiar_estado("realizada") Silent Override to "aceptada"
+In ventas/views.py lines 841-860, transitioning a CotizacionCerrada to "realizada" can
+silently result in the cotizacion ending at "aceptada" state if soft-deleted fichas are
+restored. The API response reflects the final state but the intent mismatch could confuse
+frontend code.
 
 ---
 
 ## References
 
 ### Key Files Analyzed
-- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/users/models.py`: ROLE_CHOICES, max_length=10, set_as_customer()
-- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/users/serializers.py`: ChoiceField gate, validate() branching, create() profile logic
-- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/users/views.py`: IsAdmin class, reactivate(), create_client(), set_pin() checks
-- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/authentication/views.py`: CheckUserTypeView (line 437), EmailPINRequestView (line 479)
-- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/core/views/base.py`: All core permission classes and SoftDeleteModelViewSet inline checks
-- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/logistica/views/base.py`: Duplicate IsAdminOrSeller and IsAdminSellerOrCustomer classes
-- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/ventas/views.py`: Fallthrough get_queryset() in CotizacionCerrada (line 159) and CotizacionAbierta (line 1435)
-- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/core/views/organizacion.py`: EmpresaViewSet fallthrough get_queryset()
-- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/contabilidad/models.py`: Factura, Pago, NotaCredito, ComprobanteGasto
-- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/contabilidad/views.py`: IsAuthenticated-only permissions, seller plaza filter at line 596
-- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/core/models.py`: Plaza → Vendedor ForeignKey, Vendedor → User OneToOneField
-- `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/router/index.jsx`: RootRedirect/LoginRedirect switch (lines 89–119), RoleRoute gates (lines 174, 325, 406, 427)
-- `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/components/layout/Navbar.jsx`: getNavigationLinks() role branches (lines 67–94)
-- `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/types/user.d.ts`: Role union type (line 5)
-- `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/components/forms/AdminForm.jsx`: Hardcoded role="admin"
-- `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/components/forms/SellerForm.jsx`: Hardcoded role="seller"
-- `/Users/anuareramirez/DEV/qsys/qsystem-frontend/src/pages/modules/Sales.jsx`: 30+ inline role checks
+- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/core/models.py`: CursoAgendado (line 516)
+- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/core/signals.py`: all 4 signal handlers
+- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/ventas/models.py`: CotizacionCerrada (line 87), CotizacionAbierta (line 372)
+- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/ventas/signals.py`: all signal handlers
+- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/ventas/views.py`: cambiar_estado (line 673), duplicar (line 868), send_inscription_form (line 1173)
+- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/logistica/models.py`: FichaDeInscripcion (line 103), Participante (line 650)
+- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/logistica/signals.py`: all 3 signal handlers
+- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/logistica/services/ficha_inscripcion_service.py`: all state transitions
+- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/logistica/views/fichas_inscripcion.py`: all action endpoints
+- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/contabilidad/models.py`: Factura (line 10), ItemFactura (line 279), Pago (line 408)
+- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/contabilidad/views.py`: FacturaViewSet actions
+- `/Users/anuareramirez/DEV/qsys/qsystem-backend/src/apps/core/services/curso_agendado_service.py`: reagendar_simple
 
 ---
 
 **Next Steps**:
-1. Decide the exact access level for each new role (what data they can see, what actions they can perform) before writing any code — the implementation plan above has placeholders that depend on these decisions.
-2. Start with the database migration (widening max_length and adding ROLE_CHOICES entries) as it is a hard prerequisite for all other backend work.
-3. Fix the frontend login loop immediately after the serializer/permission changes go in — otherwise new role users cannot log in at all.
-4. Update both the core and logistica permission class files in the same commit to avoid a window where one app allows access but the other does not.
+1. Clarify Issue 1: determine if send_inscription_form should delegate to cambiar_estado("aceptada") or be deprecated
+2. Decide on Issue 2: document the Cerrada-rejection-to-CANCELADO behavior as explicit business rule or align with Abierta behavior
+3. Add TRANSICIONES_VALIDAS to Factura model for consistency
+4. Consider extracting cotizacion cambiar_estado view logic into a service class
