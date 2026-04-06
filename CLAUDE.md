@@ -121,6 +121,27 @@ Two-level system: regular weekly schedule (DisponibilidadInstructor) + specific 
 
 ## Claude Code Hooks
 
-Configured in `.claude/settings.json`:
-- **PostToolUse** (Edit/Write): auto-formats files via `.claude/hooks/auto-format.sh`
-- **Stop**: notification via `.claude/hooks/notify-complete.sh`
+Configured in `~/.claude/settings.json`:
+- **PostToolUse** (Edit/Write): auto-formats Python files with `ruff format` + `ruff check --fix`
+- **PostToolUse** (Edit/Write): auto-formats frontend files (.jsx, .tsx, .js, .ts, .css, .html, .json) with `prettier --write`
+- **Stop**: plays Glass.aiff notification sound when Claude finishes responding
+- **Notification**: plays notification sound on system notifications
+- **PermissionRequest**: plays notification sound when waiting for user approval
+
+## Claude Code Agents
+
+Custom agents in `.claude/agents/`:
+- **code-reviewer**: Quality review of Django and React code (read-only)
+- **codebase-analyzer**: Architecture analysis and feature planning (read-only)
+- **django-researcher**: DRF pattern research and API planning (read-only)
+- **docker-aws-researcher**: Docker/AWS infrastructure analysis (read-only)
+- **test-runner**: Smart test orchestrator — detects what changed and runs pytest (Docker), vitest, migration checks, or all
+- **migration-planner**: Analyzes migration impact, dependency maps, conflict resolution, rollback plans
+- **commit-assistant**: Handles submodule workflow — analyzes changes, generates commit message, runs `commit-helper.sh`
+- **security-auditor**: OWASP Top 10 audit, JWT security, permissions, injection, data exposure
+
+## Permissions
+
+Auto-allowed: git, docker-compose (exec/ps/up/build/logs), npm, npx, pip3, python3, commit-helper.sh, Read, Edit, Write, Glob, Grep.
+Requires confirmation: `docker-compose down -v`, `docker system prune`, `git push --force`, `git reset --hard`.
+Denied: `rm -rf /`, `rm -rf ~`, `rm -rf .`.
