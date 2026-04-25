@@ -83,7 +83,7 @@ Django project rooted at `src/`. Settings split into `src/settings/{base,dev,pro
 
 Django apps under `src/apps/`:
 - **authentication** - JWT auth (login, logout, token refresh)
-- **users** - User model with roles: admin, seller (vendedor), customer (cliente)
+- **users** - User model with 5 roles: `admin`, `seller` (vendedor), `customer` (cliente), `data_entry` (capturista, has M2M `plazas`), `administrative` (administrativo)
 - **core** - Main business models: Vendedor, Plaza, Instructor, CursoCatalogo, CursoAgendado, etc.
 - **ventas** - Sales/quotations: CotizacionCerrada, PartidaCotizacion
 - **logistica** - Logistics management
@@ -109,7 +109,12 @@ Key directories under `src/`:
 
 Auth: JWT tokens stored in HttpOnly cookies. Axios interceptor in `src/api/axios.jsx` auto-refreshes on 401.
 
-Role-based routing: admin → `/dashboard`, seller → `/cotizaciones`, customer → `/mis-cursos`
+Role-based landing routes (see `src/router/index.jsx`):
+- `admin` → `/management`
+- `seller` → `/sales`
+- `data_entry` → `/sales`
+- `administrative` → `/accounting`
+- `customer` → `/home`
 
 ### Quotation Workflow
 
