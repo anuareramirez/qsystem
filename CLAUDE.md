@@ -20,6 +20,10 @@ docker-compose down
 
 The `.env` file lives at the project root and Docker reads it automatically. Running `npm run dev` locally will NOT pick up these env vars correctly.
 
+### Tailscale URLs
+
+Cuando el usuario manda una URL con la IP `100.70.87.18` (en vez de `localhost`) significa que está trabajando en remoto vía Tailscale, normalmente desde el iPad. Trata esa IP **igual que `localhost`**: es la misma instancia de Docker corriendo en el Mac, no un entorno distinto. Lo único que importa de la URL es la ruta y el puerto (`5173` frontend, `8003` backend) para ubicar el código a editar.
+
 ## Common Commands
 
 ```bash
